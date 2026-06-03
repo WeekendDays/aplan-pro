@@ -1,0 +1,151 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  APP_ROOT: ${{ vars.APP_ROOT || '/opt/stock-portfolio' }}
+  DATA_DIR: ${{ vars.DATA_DIR || '/var/lib/stock-portfolio' }}
+  SERVICE_NAME: ${{ vars.SERVICE_NAME || 'stock-portfolio' }}
+  RUN_USER: ${{ vars.RUN_USER || 'stockapp' }}
+  RUN_GROUP: ${{ vars.RUN_GROUP || 'stockapp' }}
+  DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || vars.DEPLOY_PORT || '22' }}
+  HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL || 'http://127.0.0.1:8080/healthz' }}
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment: production
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.DEPLOY_ENABLED == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Create runtime artifact
+        run: |
+          set -euo pipefail
+          SKIP_NPM_CI=1 SKIP_BUILD=1 bash deploy/build-artifact.sh | tee artifact-path.txt
+          artifact="$(tail -n 1 artifact-path.txt)"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$(basename "$artifact")" >> "$GITHUB_ENV"
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Set the DEPLOY_HOST repository secret}"
+          : "${DEPLOY_USER:?Set the DEPLOY_USER repository secret}"
+          : "${DEPLOY_SSH_KEY:?Set the DEPLOY_SSH_KEY repository secret}"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload production env file
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          PRODUCTION_ENV: ${{ secrets.PRODUCTION_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PRODUCTION_ENV" ]; then
+            echo "PRODUCTION_ENV is not set. Keeping the server's existing /etc/stock-portfolio.env."
+            exit 0
+          fi
+
+          printf '%s\n' "$PRODUCTION_ENV" > "$RUNNER_TEMP/stock-portfolio.env"
+          scp -P "$DEPLOY_PORT" -i ~/.ssh/deploy_key "$RUNNER_TEMP/stock-portfolio.env" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/stock-portfolio.env"
+          ssh -p "$DEPLOY_PORT" -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo install -m 600 -o root -g root /tmp/stock-portfolio.env /etc/stock-portfolio.env && rm -f /tmp/stock-portfolio.env"
+
+      - name: Upload artifact and deploy scripts
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s#^WorkingDirectory=.*#WorkingDirectory=$APP_ROOT/current#" \
+            -e "s#^User=.*#User=$RUN_USER#" \
+            -e "s#^Group=.*#Group=$RUN_GROUP#" \
+            deploy/stock-portfolio.service > "$RUNNER_TEMP/${SERVICE_NAME}.service"
+
+          scp -P "$DEPLOY_PORT" -i ~/.ssh/deploy_key \
+            "$ARTIFACT" \
+            deploy/install-artifact.sh \
+            "$RUNNER_TEMP/${SERVICE_NAME}.service" \
+            "$DEPLOY_USER@$DEPLOY_HOST:/tmp/"
+
+      - name: Install artifact on server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          ssh -p "$DEPLOY_PORT" -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "APP_ROOT='$APP_ROOT' DATA_DIR='$DATA_DIR' SERVICE_NAME='$SERVICE_NAME' RUN_USER='$RUN_USER' RUN_GROUP='$RUN_GROUP' ARTIFACT_NAME='$ARTIFACT_NAME' HEALTHCHECK_URL='$HEALTHCHECK_URL' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          if ! getent group "$RUN_GROUP" >/dev/null 2>&1; then
+            sudo groupadd --system "$RUN_GROUP"
+          fi
+
+          if ! id "$RUN_USER" >/dev/null 2>&1; then
+            sudo useradd --system --gid "$RUN_GROUP" --create-home --home-dir "$APP_ROOT" --shell /usr/sbin/nologin "$RUN_USER"
+          fi
+
+          sudo mkdir -p "$APP_ROOT" "$DATA_DIR"
+          sudo chown -R "$RUN_USER:$RUN_GROUP" "$APP_ROOT" "$DATA_DIR"
+          sudo chmod 755 /tmp/install-artifact.sh
+          sudo install -m 644 "/tmp/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+          sudo systemctl daemon-reload
+
+          if [ ! -f /etc/stock-portfolio.env ]; then
+            echo "/etc/stock-portfolio.env is missing. Set the PRODUCTION_ENV repository secret or create it on the server."
+            exit 1
+          fi
+
+          sudo env APP_ROOT="$APP_ROOT" SERVICE_NAME="$SERVICE_NAME" RUN_USER="$RUN_USER" RUN_GROUP="$RUN_GROUP" \
+            bash /tmp/install-artifact.sh "/tmp/$ARTIFACT_NAME"
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsS "$HEALTHCHECK_URL"
+          fi
+          REMOTE

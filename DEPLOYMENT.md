@@ -58,6 +58,50 @@ For full single-server steps, including no-build updates, use [deploy/README.md]
 - artifact builder: [deploy/build-artifact.sh](deploy/build-artifact.sh)
 - artifact installer: [deploy/install-artifact.sh](deploy/install-artifact.sh)
 
+## GitHub Actions Deploy
+
+The workflow in [.github/workflows/deploy.yml](.github/workflows/deploy.yml)
+builds the app on GitHub Actions, uploads the runtime artifact over SSH, and
+runs `deploy/install-artifact.sh` on the server. The server still does not run
+`npm ci` or `npm run build`.
+
+Configure these repository secrets in GitHub:
+
+- `DEPLOY_HOST`: server IP or domain.
+- `DEPLOY_USER`: SSH user on the server. This user must be able to run `sudo`
+  without an interactive password for deployment commands.
+- `DEPLOY_SSH_KEY`: private SSH key used by GitHub Actions to log in to the
+  server. Use a dedicated deploy key, not your GitHub account key.
+- `PRODUCTION_ENV`: optional content for `/etc/stock-portfolio.env`. If omitted,
+  create `/etc/stock-portfolio.env` on the server before the first deploy.
+- `DEPLOY_PORT`: optional SSH port. Defaults to `22`.
+- `DEPLOY_KNOWN_HOSTS`: optional pinned server host key. If omitted, the workflow
+  uses `ssh-keyscan`.
+
+Recommended deploy-key setup:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/aplan_github_actions -C github-actions-aplan -N ""
+ssh-copy-id -i ~/.ssh/aplan_github_actions.pub DEPLOY_USER@DEPLOY_HOST
+cat ~/.ssh/aplan_github_actions
+```
+
+Paste the private key printed by the last command into `DEPLOY_SSH_KEY`.
+
+Optional repository variables:
+
+- `DEPLOY_ENABLED`: set to `true` to deploy automatically on every push to
+  `main`. Without this, use manual runs from the Actions tab.
+- `APP_ROOT`: defaults to `/opt/stock-portfolio`.
+- `DATA_DIR`: defaults to `/var/lib/stock-portfolio`.
+- `SERVICE_NAME`: defaults to `stock-portfolio`.
+- `RUN_USER`: defaults to `stockapp`.
+- `RUN_GROUP`: defaults to `stockapp`.
+- `HEALTHCHECK_URL`: defaults to `http://127.0.0.1:8080/healthz`.
+
+The workflow can be run manually from the GitHub Actions tab. Pushes to `main`
+deploy automatically only after `DEPLOY_ENABLED=true` is set.
+
 Recommended production settings:
 
 - Put the service behind HTTPS before exposing it publicly.
