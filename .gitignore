@@ -1,0 +1,26 @@
+# 依赖文件
+node_modules/
+
+# 构建输出
+dist/
+build/
+release/
+
+# 本地运行数据
+data/
+
+# 环境变量文件
+.env
+.env.local
+
+# 日志文件
+*.log
+
+# 系统文件
+.DS_Store
+
+# 编辑器配置
+.vscode/
+
+# cursor 相关
+.cursorrules

@@ -1,0 +1,22 @@
+[Unit]
+Description=Stock Portfolio web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stock-portfolio/current
+EnvironmentFile=/etc/stock-portfolio.env
+ExecStart=/usr/bin/node server/server.js
+Restart=always
+RestartSec=5
+User=stockapp
+Group=stockapp
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/stock-portfolio
+
+[Install]
+WantedBy=multi-user.target
