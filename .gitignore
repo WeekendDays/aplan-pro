@@ -8,6 +8,9 @@ release/
 
 # 本地运行数据
 data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # 环境变量文件
 .env

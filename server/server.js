@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { createStorage } = require('./storage');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -16,6 +17,7 @@ const QUOTE_REFRESH_TIMEOUT_MS = Number(process.env.QUOTE_REFRESH_TIMEOUT_MS || 
 const PRICE_SYMBOL_MAP = process.env.PRICE_SYMBOL_MAP ? JSON.parse(process.env.PRICE_SYMBOL_MAP) : {};
 const LOGIN_RATE_LIMIT_WINDOW_MS = Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 10);
+const storage = createStorage({ dataDir: DATA_DIR, dataFile: DATA_FILE, isProduction: IS_PRODUCTION });
 
 const loginAttempts = new Map();
 const users = loadUsers();
@@ -72,24 +74,12 @@ function publicUser(user) {
   };
 }
 
-function ensureStore() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(DATA_FILE)) {
-    writeStore({ holdings: [], trades: [], fund_flows: [] });
-  }
-}
-
 function readStore() {
-  ensureStore();
-  const raw = fs.readFileSync(DATA_FILE, 'utf8');
-  return JSON.parse(raw);
+  return storage.read();
 }
 
 function writeStore(store) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmpFile = `${DATA_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(store, null, 2));
-  fs.renameSync(tmpFile, DATA_FILE);
+  storage.write(store);
 }
 
 function sendJson(res, status, payload, headers = {}) {
@@ -683,13 +673,13 @@ function serveStatic(req, res, url) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-ensureStore();
+storage.ensure();
 
 http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
   if (url.pathname === '/healthz') {
-    sendJson(res, 200, { ok: true, uptime: Math.round(process.uptime()) });
+    sendJson(res, 200, { ok: true, uptime: Math.round(process.uptime()), storage: storage.driver });
     return;
   }
 
@@ -701,5 +691,6 @@ http.createServer((req, res) => {
   serveStatic(req, res, url);
 }).listen(PORT, HOST, () => {
   console.log(`[stock-app] listening on http://${HOST}:${PORT}`);
-  console.log(`[stock-app] data file: ${DATA_FILE}`);
+  console.log(`[stock-app] storage: ${storage.driver}`);
+  console.log(`[stock-app] data file: ${storage.driver === 'sqlite' ? storage.dbFile : storage.dataFile}`);
 });

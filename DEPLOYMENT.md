@@ -40,6 +40,8 @@ PORT=8080 \
 HOST=127.0.0.1 \
 NODE_ENV=production \
 DATA_DIR=/var/lib/stock-portfolio \
+STORAGE_DRIVER=sqlite \
+DB_FILE=/var/lib/stock-portfolio/aplan.sqlite \
 COOKIE_SECURE=true \
 STOCK_APP_USERNAME=operator \
 STOCK_APP_PASSWORD=change-me \
@@ -63,7 +65,9 @@ For full single-server steps, including no-build updates, use [deploy/README.md]
 The workflow in [.github/workflows/deploy.yml](.github/workflows/deploy.yml)
 builds the app on GitHub Actions, uploads the runtime artifact over SSH, and
 runs `deploy/install-artifact.sh` on the server. The server still does not run
-`npm ci` or `npm run build`.
+`npm ci` or `npm run build`. During deployment the workflow checks the server
+runtime and installs Node.js 20 and SQLite when they are missing on common
+Ubuntu/Debian, CentOS, Alibaba Cloud Linux, or other yum/dnf based images.
 
 Configure these repository secrets in GitHub:
 
@@ -99,6 +103,23 @@ Optional repository variables:
 - `RUN_GROUP`: defaults to `stockapp`.
 - `HEALTHCHECK_URL`: defaults to `http://127.0.0.1:8080/healthz`.
 
+Recommended `PRODUCTION_ENV` secret:
+
+```env
+NODE_ENV=production
+PORT=8080
+HOST=127.0.0.1
+DATA_DIR=/var/lib/stock-portfolio
+STORAGE_DRIVER=sqlite
+DB_FILE=/var/lib/stock-portfolio/aplan.sqlite
+COOKIE_SECURE=true
+STOCK_APP_USERNAME=operator
+STOCK_APP_PASSWORD=replace-with-a-strong-password
+SESSION_TTL_DAYS=30
+SESSION_SECRET=replace-with-at-least-32-random-characters
+QUOTE_REFRESH_TIMEOUT_MS=10000
+```
+
 The workflow can be run manually from the GitHub Actions tab. Pushes to `main`
 deploy automatically only after `DEPLOY_ENABLED=true` is set.
 
@@ -106,8 +127,29 @@ Recommended production settings:
 
 - Put the service behind HTTPS before exposing it publicly.
 - Set `COOKIE_SECURE=true` when the public URL is HTTPS.
-- Point `DATA_DIR` to a persistent disk. The default is `./data`.
+- Use `STORAGE_DRIVER=sqlite` in production. The default production database
+  path is `/var/lib/stock-portfolio/aplan.sqlite`.
+- Point `DATA_DIR` and `DB_FILE` to a persistent disk.
 - Replace the sample password before sharing the link.
 - Login cookies are long-lived by default: `SESSION_TTL_DAYS=30`. Set `SESSION_SECRET` to a stable random string so sessions survive service restarts and can be invalidated intentionally by rotating the secret.
 - The app uses a single login account. The backend still treats this account as an operator so it can manage trades and fund flows.
 - Holding prices are refreshed by the backend via Tencent quote data. Use `PRICE_SYMBOL_MAP` when a local stock code needs a custom quote symbol, for example `{"BRK.B":"usBRK.B","00700":"hk00700"}`.
+
+## Data Storage
+
+Development can still use the JSON store by setting `STORAGE_DRIVER=json`, but
+production defaults to SQLite. On first SQLite startup, if the database is empty
+and `DATA_FILE`/`data/store.json` exists, the app imports existing JSON data
+into SQLite automatically.
+
+For a single Alibaba Cloud ECS instance, SQLite with WAL is the recommended
+production baseline: it is local, fast, transactional, and simple to back up.
+Use Alibaba Cloud RDS MySQL/PostgreSQL later if you need multiple app servers,
+remote database management, point-in-time recovery, or managed high
+availability.
+
+Back up SQLite with:
+
+```bash
+sudo sqlite3 /var/lib/stock-portfolio/aplan.sqlite ".backup '/var/lib/stock-portfolio/aplan.$(date +%F-%H%M%S).sqlite'"
+```

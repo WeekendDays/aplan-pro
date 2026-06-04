@@ -46,6 +46,7 @@ export default function App() {
           <Route path="trades" element={<TradeRecords />} />
           <Route path="pnl" element={<PnLAnalysis />} />
           <Route path="funds" element={<FundFlows />} />
+          <Route path="*" element={<Navigate to="/holdings" replace />} />
         </Route>
       </Routes>
     </HashRouter>

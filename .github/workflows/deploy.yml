@@ -43,6 +43,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Type check
+        run: npm run typecheck
+
       - name: Build frontend
         run: npm run build
 
@@ -122,6 +125,45 @@ jobs:
           ssh -p "$DEPLOY_PORT" -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             "APP_ROOT='$APP_ROOT' DATA_DIR='$DATA_DIR' SERVICE_NAME='$SERVICE_NAME' RUN_USER='$RUN_USER' RUN_GROUP='$RUN_GROUP' ARTIFACT_NAME='$ARTIFACT_NAME' HEALTHCHECK_URL='$HEALTHCHECK_URL' bash -s" <<'REMOTE'
           set -euo pipefail
+
+          node_major=0
+          if command -v node >/dev/null 2>&1; then
+            node_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+          fi
+
+          if [ "$node_major" -lt 20 ]; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+              sudo apt-get install -y nodejs
+            elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y ca-certificates curl
+              curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+              sudo dnf install -y nodejs
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y ca-certificates curl
+              curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+              sudo yum install -y nodejs
+            else
+              echo "Node.js 20+ is required but no supported package manager was found."
+              exit 1
+            fi
+          fi
+
+          if ! command -v sqlite3 >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y sqlite3
+            elif command -v dnf >/dev/null 2>&1; then
+              sudo dnf install -y sqlite
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y sqlite
+            else
+              echo "sqlite3 is required but no supported package manager was found."
+              exit 1
+            fi
+          fi
 
           if ! getent group "$RUN_GROUP" >/dev/null 2>&1; then
             sudo groupadd --system "$RUN_GROUP"

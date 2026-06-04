@@ -6,6 +6,7 @@ Assumptions:
 - App path: `/opt/stock-portfolio`
 - Data path: `/var/lib/stock-portfolio`
 - Node service listens on `127.0.0.1:8080`
+- Production data is stored in SQLite at `/var/lib/stock-portfolio/aplan.sqlite`
 - Nginx terminates HTTPS and proxies to Node
 - Server needs a Node.js runtime, but does not need npm install/build steps
 - Frontend build happens locally or in CI, not on the server
@@ -100,6 +101,10 @@ The repository includes `.github/workflows/deploy.yml`. GitHub Actions builds
 the frontend, creates the runtime artifact, uploads it to the server, installs
 the systemd unit, and runs `install-artifact.sh`.
 
+The workflow also runs `npm run typecheck` before building, and on the server it
+checks for Node.js 20 and SQLite. If either is missing, it installs them through
+`apt-get`, `dnf`, or `yum` when available.
+
 Required repository secrets:
 
 - `DEPLOY_HOST`: server IP or domain.
@@ -127,6 +132,23 @@ The deploy SSH user must be able to run `sudo` without an interactive password.
 If `PRODUCTION_ENV` is not set, create `/etc/stock-portfolio.env` on the server
 before the first workflow run.
 
+Recommended `PRODUCTION_ENV`:
+
+```env
+NODE_ENV=production
+PORT=8080
+HOST=127.0.0.1
+DATA_DIR=/var/lib/stock-portfolio
+STORAGE_DRIVER=sqlite
+DB_FILE=/var/lib/stock-portfolio/aplan.sqlite
+COOKIE_SECURE=true
+STOCK_APP_USERNAME=operator
+STOCK_APP_PASSWORD=replace-with-a-strong-password
+SESSION_TTL_DAYS=30
+SESSION_SECRET=replace-with-at-least-32-random-characters
+QUOTE_REFRESH_TIMEOUT_MS=10000
+```
+
 Manual runs work from the GitHub Actions tab. To deploy automatically on every
 push to `main`, set repository variable `DEPLOY_ENABLED=true`.
 
@@ -142,8 +164,12 @@ sudo systemctl restart stock-portfolio
 
 ## Backup
 
-Back up `/var/lib/stock-portfolio/store.json`. For example:
+Back up SQLite with the SQLite shell. For example:
 
 ```bash
-sudo cp /var/lib/stock-portfolio/store.json "/var/lib/stock-portfolio/store.$(date +%F-%H%M%S).json"
+sudo sqlite3 /var/lib/stock-portfolio/aplan.sqlite ".backup '/var/lib/stock-portfolio/aplan.$(date +%F-%H%M%S).sqlite'"
 ```
+
+If you previously used the JSON store, keep `/var/lib/stock-portfolio/store.json`
+in place for the first SQLite startup. The server imports it automatically when
+the SQLite database is empty.

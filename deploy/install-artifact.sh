@@ -7,6 +7,7 @@ SERVICE_NAME="${SERVICE_NAME:-stock-portfolio}"
 RUN_USER="${RUN_USER:-stockapp}"
 RUN_GROUP="${RUN_GROUP:-stockapp}"
 RESTART_SERVICE="${RESTART_SERVICE:-1}"
+ENV_FILE="${ENV_FILE:-/etc/stock-portfolio.env}"
 
 if [ -z "$ARTIFACT" ]; then
   echo "Usage: sudo bash deploy/install-artifact.sh /path/to/stock-portfolio-*.tar.gz"
@@ -20,6 +21,18 @@ fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root, for example: sudo bash deploy/install-artifact.sh $ARTIFACT"
+  exit 1
+fi
+
+STORAGE_DRIVER_VALUE=""
+if [ -f "$ENV_FILE" ]; then
+  STORAGE_DRIVER_VALUE="$(sed -n 's/^STORAGE_DRIVER=//p' "$ENV_FILE" | tail -n 1 | tr -d '"')"
+fi
+STORAGE_DRIVER_VALUE="${STORAGE_DRIVER_VALUE:-sqlite}"
+
+if [ "$STORAGE_DRIVER_VALUE" = "sqlite" ] && ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "sqlite3 is required when STORAGE_DRIVER=sqlite."
+  echo "Install it first, for example: sudo apt-get install -y sqlite3 or sudo yum install -y sqlite."
   exit 1
 fi
 

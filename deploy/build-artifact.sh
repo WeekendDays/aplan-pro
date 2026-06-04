@@ -29,6 +29,7 @@ COPYFILE_DISABLE=1 tar -czf "$ARTIFACT" \
   dist \
   server \
   deploy \
+  migrations \
   .env.production.example \
   package.json
 
