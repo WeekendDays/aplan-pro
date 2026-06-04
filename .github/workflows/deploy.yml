@@ -41,12 +41,24 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        env:
+          NODE_ENV: development
+          NPM_CONFIG_PRODUCTION: "false"
+        run: npm ci --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+
+      - name: Verify dependencies
+        run: |
+          node -e "require.resolve('react'); require.resolve('react/jsx-runtime'); require.resolve('react-router-dom'); require.resolve('@types/react/package.json'); console.log('dependencies ok')"
+          npm ls react react-router-dom @types/react typescript --depth=0
 
       - name: Type check
+        env:
+          NODE_ENV: development
         run: npm run typecheck
 
       - name: Build frontend
+        env:
+          NODE_ENV: production
         run: npm run build
 
       - name: Create runtime artifact
