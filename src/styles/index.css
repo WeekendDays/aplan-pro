@@ -421,6 +421,11 @@ select:focus {
   gap: 10px;
   min-height: 92px;
   padding: 16px;
+  position: relative;
+}
+
+.profit-card {
+  padding-bottom: 34px;
 }
 
 .metric-card span {
@@ -434,6 +439,24 @@ select:focus {
   font-size: 24px;
   font-weight: 700;
   line-height: 1.08;
+}
+
+.metric-corner {
+  align-items: baseline;
+  bottom: 13px;
+  display: flex;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 6px;
+  line-height: 1;
+  position: absolute;
+  right: 16px;
+}
+
+.metric-corner small {
+  color: #86868b;
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .metric-card strong.positive,

@@ -47,9 +47,13 @@ export default function Holdings() {
       (sum, item) => sum + Number(item.current_price) * Number(item.quantity),
       0
     );
+    const todayPnl = holdings.reduce(
+      (sum, item) => sum + Number(item.quote_change || 0) * Number(item.quantity),
+      0
+    );
     const pnl = marketValue - totalCost;
     const pnlRate = totalCost > 0 ? (pnl / totalCost) * 100 : 0;
-    return { totalCost, marketValue, pnl, pnlRate };
+    return { totalCost, marketValue, pnl, pnlRate, todayPnl };
   }, [holdings]);
 
   async function handleRefreshPrices() {
@@ -119,13 +123,17 @@ export default function Holdings() {
           <span>总成本</span>
           <strong>{money(summary.totalCost)}</strong>
         </div>
-        <div className="metric-card">
+        <div className="metric-card profit-card">
           <span>持仓盈亏</span>
           <strong className={pnlClass(summary.pnl)}>{money(summary.pnl)}</strong>
+          <div className={`metric-corner ${pnlClass(summary.pnlRate)}`}>
+            <small>收益率</small>
+            <b>{percent(summary.pnlRate)}</b>
+          </div>
         </div>
         <div className="metric-card">
-          <span>收益率</span>
-          <strong className={pnlClass(summary.pnlRate)}>{percent(summary.pnlRate)}</strong>
+          <span>今日盈亏</span>
+          <strong className={pnlClass(summary.todayPnl)}>{money(summary.todayPnl)}</strong>
         </div>
       </div>
 
