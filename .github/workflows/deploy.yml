@@ -41,27 +41,48 @@ jobs:
           cache: npm
 
       - name: Install dependencies
+        working-directory: ${{ github.workspace }}
         env:
           NODE_ENV: development
           NPM_CONFIG_PRODUCTION: "false"
-        run: npm ci --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+        run: |
+          set -euo pipefail
+          echo "workspace=$GITHUB_WORKSPACE"
+          echo "pwd=$(pwd)"
+          node --version
+          npm --version
+          echo "npm production=$(npm config get production)"
+          echo "npm omit=$(npm config get omit)"
+          echo "npm prefix=$(npm config get prefix)"
+          npm ci --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+          if [ ! -d node_modules/react ]; then
+            echo "node_modules/react is missing after npm ci; retrying with npm install."
+            npm install --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+          fi
+          test -d node_modules/react
+          test -d node_modules/react-router-dom
+          test -d node_modules/@types/react
 
       - name: Verify dependencies
+        working-directory: ${{ github.workspace }}
         run: |
           node -e "require.resolve('react'); require.resolve('react/jsx-runtime'); require.resolve('react-router-dom'); require.resolve('@types/react/package.json'); console.log('dependencies ok')"
           npm ls react react-router-dom @types/react typescript --depth=0
 
       - name: Type check
+        working-directory: ${{ github.workspace }}
         env:
           NODE_ENV: development
         run: npm run typecheck
 
       - name: Build frontend
+        working-directory: ${{ github.workspace }}
         env:
           NODE_ENV: production
         run: npm run build
 
       - name: Create runtime artifact
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           SKIP_NPM_CI=1 SKIP_BUILD=1 bash deploy/build-artifact.sh | tee artifact-path.txt
