@@ -241,6 +241,18 @@ jobs:
             bash /tmp/install-artifact.sh "/tmp/$ARTIFACT_NAME"
 
           if command -v curl >/dev/null 2>&1; then
-            curl -fsS "$HEALTHCHECK_URL"
+            for attempt in $(seq 1 30); do
+              if curl -fsS --max-time 5 "$HEALTHCHECK_URL"; then
+                echo "Healthcheck passed on attempt $attempt."
+                exit 0
+              fi
+              echo "Waiting for $SERVICE_NAME to pass healthcheck ($attempt/30)..."
+              sleep 2
+            done
+
+            echo "Healthcheck failed after 30 attempts."
+            sudo systemctl status "$SERVICE_NAME" --no-pager --lines=50 || true
+            sudo journalctl -u "$SERVICE_NAME" --no-pager --lines=100 || true
+            exit 1
           fi
           REMOTE
