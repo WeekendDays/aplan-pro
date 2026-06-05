@@ -15,6 +15,8 @@ concurrency:
 
 env:
   NODE_VERSION: "20"
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  NPM_CONFIG_REPLACE_REGISTRY_HOST: "always"
   APP_ROOT: ${{ vars.APP_ROOT || '/opt/stock-portfolio' }}
   DATA_DIR: ${{ vars.DATA_DIR || '/var/lib/stock-portfolio' }}
   SERVICE_NAME: ${{ vars.SERVICE_NAME || 'stock-portfolio' }}
@@ -54,10 +56,12 @@ jobs:
           echo "npm production=$(npm config get production)"
           echo "npm omit=$(npm config get omit)"
           echo "npm prefix=$(npm config get prefix)"
-          npm ci --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+          echo "npm registry=$(npm config get registry)"
+          echo "npm replace-registry-host=$(npm config get replace-registry-host)"
+          npm ci --include=dev --no-audit --no-fund
           if [ ! -d node_modules/react ]; then
             echo "node_modules/react is missing after npm ci; retrying with npm install."
-            npm install --include=dev --no-audit --no-fund --registry=https://registry.npmjs.org
+            npm install --include=dev --no-audit --no-fund
           fi
           test -d node_modules/react
           test -d node_modules/react-router-dom
@@ -65,8 +69,24 @@ jobs:
 
       - name: Verify dependencies
         working-directory: ${{ github.workspace }}
+        env:
+          NODE_ENV: development
+          NPM_CONFIG_PRODUCTION: "false"
         run: |
-          node -e "require.resolve('react'); require.resolve('react/jsx-runtime'); require.resolve('react-router-dom'); require.resolve('@types/react/package.json'); console.log('dependencies ok')"
+          set -euo pipefail
+          if [ ! -d node_modules/react ] || [ ! -d node_modules/react-router-dom ] || [ ! -d node_modules/@types/react ]; then
+            echo "Expected dependencies are missing before verification; reinstalling."
+            npm ci --include=dev --no-audit --no-fund
+          fi
+          node <<'NODE'
+          const path = require('path');
+          const root = process.env.GITHUB_WORKSPACE || process.cwd();
+          for (const request of ['react', 'react/jsx-runtime', 'react-router-dom', '@types/react/package.json']) {
+            const resolved = require.resolve(request, { paths: [root] });
+            console.log(`${request} -> ${path.relative(root, resolved)}`);
+          }
+          console.log('dependencies ok');
+          NODE
           npm ls react react-router-dom @types/react typescript --depth=0
 
       - name: Type check
