@@ -1485,6 +1485,39 @@ select:focus {
 
 .trade-table-shell {
   border-radius: 14px;
+  overflow-x: auto;
+}
+
+.trade-table {
+  min-width: 1080px;
+}
+
+.trade-actions-col {
+  width: 132px;
+}
+
+.trade-row-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-start;
+}
+
+.trade-action-button {
+  min-height: 30px;
+  padding: 5px 9px;
+  white-space: nowrap;
+}
+
+.danger-button {
+  border-color: rgba(239, 68, 68, 0.24);
+  color: var(--danger-red);
+}
+
+.danger-button:hover {
+  background: rgba(127, 29, 29, 0.16);
+  border-color: rgba(239, 68, 68, 0.38);
+  color: #fecaca;
 }
 
 .modal-backdrop {

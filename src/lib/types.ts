@@ -69,6 +69,8 @@ export interface CreateTradeInput {
   note?: string;
 }
 
+export type UpdateTradeInput = CreateTradeInput;
+
 export interface CreateFundFlowInput {
   flow_type: FlowType;
   amount: number;

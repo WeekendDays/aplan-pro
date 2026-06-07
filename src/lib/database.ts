@@ -7,6 +7,7 @@ import {
   PortfolioNavResult,
   PriceRefreshResult,
   Trade,
+  UpdateTradeInput,
   User,
 } from './types';
 
@@ -213,6 +214,20 @@ export async function createTrade(input: CreateTradeInput): Promise<Trade> {
     body: input,
   });
   return result.trade;
+}
+
+export async function updateTrade(id: string, input: UpdateTradeInput): Promise<Trade> {
+  const result = await request<{ trade: Trade }>(`/api/trades/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: input,
+  });
+  return result.trade;
+}
+
+export async function deleteTrade(id: string): Promise<void> {
+  await request<{ ok: boolean }>(`/api/trades/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
 }
 
 export async function getFundFlows(): Promise<FundFlow[]> {

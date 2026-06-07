@@ -598,6 +598,77 @@ function updateHoldingsForTrade(store, trade) {
   }
 }
 
+function tradeFromBody(body, user, existing = {}) {
+  const stockCode = String(body.stock_code || '').trim().toUpperCase();
+  const stockName = String(body.stock_name || '').trim();
+  const tradeType = body.trade_type;
+  const quantity = numberFrom(body.quantity, 'quantity');
+  const price = numberFrom(body.price, 'price');
+  const commission = optionalNumberFrom(body.commission, 'commission', 0);
+  const sectors = normalizeSectors(body.sectors);
+  const tradeTime = new Date(body.trade_time);
+
+  if (!stockCode || !stockName) throw new Error('stock_code and stock_name are required');
+  if (!['buy', 'sell'].includes(tradeType)) throw new Error('trade_type must be buy or sell');
+  if (!Number.isInteger(quantity) || quantity <= 0) throw new Error('quantity must be a positive integer');
+  if (price <= 0) throw new Error('price must be greater than 0');
+  if (commission < 0) throw new Error('commission must be greater than or equal to 0');
+  if (Number.isNaN(tradeTime.getTime())) throw new Error('trade_time is invalid');
+
+  const now = new Date().toISOString();
+  return {
+    id: existing.id || crypto.randomUUID(),
+    stock_code: stockCode,
+    stock_name: stockName,
+    sectors,
+    trade_type: tradeType,
+    quantity,
+    price,
+    commission,
+    trade_time: tradeTime.toISOString(),
+    note: String(body.note || ''),
+    created_by: existing.created_by || user.id,
+    created_at: existing.created_at || now,
+  };
+}
+
+function rebuildHoldingsFromTrades(store) {
+  const previousHoldings = new Map(
+    (store.holdings || []).map(holding => [String(holding.stock_code || '').toUpperCase(), { ...holding }])
+  );
+
+  store.holdings = [];
+  [...(store.trades || [])]
+    .sort((a, b) => {
+      const dateDiff = new Date(a.trade_time).getTime() - new Date(b.trade_time).getTime();
+      if (dateDiff !== 0) return dateDiff;
+      return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    })
+    .forEach(trade => updateHoldingsForTrade(store, trade));
+
+  store.holdings.forEach(holding => {
+    const previous = previousHoldings.get(String(holding.stock_code || '').toUpperCase());
+    if (!previous) return;
+
+    holding.id = previous.id || holding.id;
+    holding.created_at = previous.created_at || holding.created_at;
+    if (Number(previous.current_price) > 0) holding.current_price = Number(previous.current_price);
+
+    [
+      'quote_symbol',
+      'quote_source',
+      'quote_time',
+      'quote_change',
+      'quote_change_percent',
+      'quote_updated_at',
+    ].forEach(field => {
+      if (previous[field] !== undefined && previous[field] !== null && previous[field] !== '') {
+        holding[field] = previous[field];
+      }
+    });
+  });
+}
+
 function normalizeTencentSymbol(stockCode) {
   const code = String(stockCode || '').trim().toUpperCase();
   if (PRICE_SYMBOL_MAP[code]) return PRICE_SYMBOL_MAP[code];
@@ -1419,43 +1490,52 @@ async function handleApi(req, res, url) {
     if (url.pathname === '/api/trades' && req.method === 'POST') {
       if (!requireOperator(user, res)) return;
       const body = await readBody(req);
-      const stockCode = String(body.stock_code || '').trim().toUpperCase();
-      const stockName = String(body.stock_name || '').trim();
-      const tradeType = body.trade_type;
-      const quantity = numberFrom(body.quantity, 'quantity');
-      const price = numberFrom(body.price, 'price');
-      const commission = optionalNumberFrom(body.commission, 'commission', 0);
-      const sectors = normalizeSectors(body.sectors);
-      const tradeTime = new Date(body.trade_time);
-
-      if (!stockCode || !stockName) throw new Error('stock_code and stock_name are required');
-      if (!['buy', 'sell'].includes(tradeType)) throw new Error('trade_type must be buy or sell');
-      if (!Number.isInteger(quantity) || quantity <= 0) throw new Error('quantity must be a positive integer');
-      if (price <= 0) throw new Error('price must be greater than 0');
-      if (commission < 0) throw new Error('commission must be greater than or equal to 0');
-      if (Number.isNaN(tradeTime.getTime())) throw new Error('trade_time is invalid');
-
-      const now = new Date().toISOString();
-      const trade = {
-        id: crypto.randomUUID(),
-        stock_code: stockCode,
-        stock_name: stockName,
-        sectors,
-        trade_type: tradeType,
-        quantity,
-        price,
-        commission,
-        trade_time: tradeTime.toISOString(),
-        note: String(body.note || ''),
-        created_by: user.id,
-        created_at: now,
-      };
+      const trade = tradeFromBody(body, user);
 
       const store = readStore();
       store.trades.push(trade);
       updateHoldingsForTrade(store, trade);
       writeStore(store);
       sendJson(res, 201, { trade });
+      return;
+    }
+
+    const tradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)$/);
+    if (tradeMatch && req.method === 'PATCH') {
+      if (!requireOperator(user, res)) return;
+      const id = decodeURIComponent(tradeMatch[1]);
+      const body = await readBody(req);
+      const store = readStore();
+      const index = store.trades.findIndex(trade => trade.id === id);
+
+      if (index < 0) {
+        sendError(res, 404, 'Trade not found');
+        return;
+      }
+
+      const trade = tradeFromBody(body, user, store.trades[index]);
+      store.trades[index] = trade;
+      rebuildHoldingsFromTrades(store);
+      writeStore(store);
+      sendJson(res, 200, { trade });
+      return;
+    }
+
+    if (tradeMatch && req.method === 'DELETE') {
+      if (!requireOperator(user, res)) return;
+      const id = decodeURIComponent(tradeMatch[1]);
+      const store = readStore();
+      const existing = store.trades.find(trade => trade.id === id);
+
+      if (!existing) {
+        sendError(res, 404, 'Trade not found');
+        return;
+      }
+
+      store.trades = store.trades.filter(trade => trade.id !== id);
+      rebuildHoldingsFromTrades(store);
+      writeStore(store);
+      sendJson(res, 200, { ok: true, trade: existing });
       return;
     }
 
