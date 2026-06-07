@@ -13,9 +13,11 @@
       - `id` (uuid, primary key)
       - `stock_code` (text, 股票代码)
       - `stock_name` (text, 股票名称)
+      - `sectors` (jsonb, 多选板块)
       - `trade_type` (text, buy/sell)
       - `quantity` (integer, 数量)
       - `price` (numeric, 成交价格)
+      - `commission` (numeric, 佣金)
       - `trade_time` (timestamp, 交易时间)
       - `note` (text, 备注)
       - `created_by` (text, references users.id)
@@ -24,6 +26,7 @@
       - `id` (uuid, primary key)
       - `stock_code` (text, 股票代码)
       - `stock_name` (text, 股票名称)
+      - `sectors` (jsonb, 多选板块)
       - `quantity` (integer, 持仓数量)
       - `cost_price` (numeric, 成本价)
       - `total_cost` (numeric, 总成本)
@@ -112,14 +115,22 @@ CREATE TABLE IF NOT EXISTS trades(
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   stock_code TEXT NOT NULL,
   stock_name TEXT NOT NULL DEFAULT '',
+  sectors JSONB NOT NULL DEFAULT '[]'::jsonb,
   trade_type TEXT NOT NULL CHECK(trade_type IN ('buy', 'sell')),
   quantity INTEGER NOT NULL CHECK(quantity > 0),
   price NUMERIC(12, 4) NOT NULL CHECK(price > 0),
+  commission NUMERIC(12, 4) NOT NULL DEFAULT 0 CHECK(commission >= 0),
   trade_time TIMESTAMP WITH TIME ZONE NOT NULL,
   note TEXT DEFAULT '',
   created_by TEXT REFERENCES users(id),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE trades
+  ADD COLUMN IF NOT EXISTS sectors JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE trades
+  ADD COLUMN IF NOT EXISTS commission NUMERIC(12, 4) NOT NULL DEFAULT 0 CHECK(commission >= 0);
 
 DO $$
 BEGIN
@@ -157,6 +168,7 @@ CREATE TABLE IF NOT EXISTS holdings(
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   stock_code TEXT NOT NULL UNIQUE,
   stock_name TEXT NOT NULL DEFAULT '',
+  sectors JSONB NOT NULL DEFAULT '[]'::jsonb,
   quantity INTEGER NOT NULL DEFAULT 0,
   cost_price NUMERIC(12, 4) NOT NULL DEFAULT 0,
   total_cost NUMERIC(14, 4) NOT NULL DEFAULT 0,
@@ -164,6 +176,9 @@ CREATE TABLE IF NOT EXISTS holdings(
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE holdings
+  ADD COLUMN IF NOT EXISTS sectors JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 DO $$
 BEGIN

@@ -27,7 +27,7 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="min-h-dvh bg-[#f5f5f5] flex items-center justify-center text-[13px] text-[#8c8c8c]">
+      <div className="min-h-dvh bg-[#030712] flex items-center justify-center text-[13px] text-[#94a3b8]">
         Loading...
       </div>
     );

@@ -8,7 +8,7 @@ Assumptions:
 - Node service listens on `127.0.0.1:8080`
 - Production data is stored in SQLite at `/var/lib/stock-portfolio/aplan.sqlite`
 - Nginx terminates HTTPS and proxies to Node
-- Server needs a Node.js runtime, but does not need npm install/build steps
+- Server needs Node.js and SQLite, but does not need npm install/build steps
 - Frontend build happens locally or in CI, not on the server
 
 ## Build an artifact
@@ -47,6 +47,17 @@ scp release/stock-portfolio-*.tar.gz deploy/install-artifact.sh deploy/stock-por
 sudo useradd --system --create-home --home-dir /opt/stock-portfolio --shell /usr/sbin/nologin stockapp
 sudo mkdir -p /opt/stock-portfolio /var/lib/stock-portfolio
 sudo chown -R stockapp:stockapp /opt/stock-portfolio /var/lib/stock-portfolio
+```
+
+Install runtime packages if they are not already available:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y nodejs sqlite3
+
+# CentOS/Alibaba Cloud Linux style systems
+sudo yum install -y nodejs sqlite
 ```
 
 Install the uploaded artifact without starting the service yet:
@@ -147,7 +158,16 @@ STOCK_APP_PASSWORD=replace-with-a-strong-password
 SESSION_TTL_DAYS=30
 SESSION_SECRET=replace-with-at-least-32-random-characters
 QUOTE_REFRESH_TIMEOUT_MS=10000
+NAV_HISTORY_TIMEOUT_MS=8000
+ALPACA_API_KEY_ID=replace-with-your-alpaca-key-id
+ALPACA_API_SECRET_KEY=replace-with-your-alpaca-secret-key
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets/v2
+ALPACA_DATA_FEED=iex
+ALPACA_DATA_ADJUSTMENT=raw
 ```
+
+The Node app fetches US stock and ETF quotes from Alpaca Market Data snapshots,
+and fetches historical daily closes from Alpaca bars.
 
 Manual runs work from the GitHub Actions tab. To deploy automatically on every
 push to `main`, set repository variable `DEPLOY_ENABLED=true`.

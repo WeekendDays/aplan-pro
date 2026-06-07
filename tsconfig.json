@@ -7,6 +7,7 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "types": ["react", "react-dom"],
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,

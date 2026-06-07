@@ -12,6 +12,7 @@ export interface Holding {
   id: string;
   stock_code: string;
   stock_name: string;
+  sectors: string[];
   quantity: number;
   cost_price: number;
   total_cost: number;
@@ -32,9 +33,11 @@ export interface Trade {
   id: string;
   stock_code: string;
   stock_name: string;
+  sectors: string[];
   trade_type: TradeType;
   quantity: number;
   price: number;
+  commission: number;
   trade_time: string;
   note: string;
   created_by: string;
@@ -57,9 +60,11 @@ export interface FundFlow {
 export interface CreateTradeInput {
   stock_code: string;
   stock_name: string;
+  sectors?: string[];
   trade_type: TradeType;
   quantity: number;
   price: number;
+  commission?: number;
   trade_time: string;
   note?: string;
 }
@@ -76,4 +81,30 @@ export interface PriceRefreshResult {
   refreshed: string[];
   failed: string[];
   refreshed_at: string;
+}
+
+export type PerformanceRange = '1D' | '7D' | '1M' | 'YTD';
+
+export interface PortfolioNavPoint {
+  cashBalance: number;
+  date: string;
+  fallbackPricedPositions: number;
+  marketValue: number;
+  quotePricedPositions: number;
+  totalAssets: number;
+  unitNav: number;
+  units: number;
+}
+
+export interface PortfolioNavResult {
+  data_note: string;
+  fallback_priced_positions: number;
+  generated_at: string;
+  infer_trade_flows: boolean;
+  latest_date: string;
+  points: PortfolioNavPoint[];
+  quote_priced_positions: number;
+  range: PerformanceRange;
+  return_rate: number | null;
+  start_date: string;
 }

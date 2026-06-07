@@ -5,9 +5,76 @@ const { execFileSync } = require('child_process');
 
 function normalizeStore(store) {
   return {
-    holdings: Array.isArray(store && store.holdings) ? store.holdings : [],
-    trades: Array.isArray(store && store.trades) ? store.trades : [],
+    holdings: Array.isArray(store && store.holdings)
+      ? store.holdings.map(normalizeHolding)
+      : [],
+    trades: Array.isArray(store && store.trades)
+      ? store.trades.map(normalizeTrade)
+      : [],
     fund_flows: Array.isArray(store && store.fund_flows) ? store.fund_flows : [],
+    quote_history: Array.isArray(store && store.quote_history)
+      ? store.quote_history.map(normalizeQuoteHistory).filter(Boolean)
+      : [],
+  };
+}
+
+function normalizeSectors(value) {
+  let raw = value;
+
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    if (!text) return [];
+
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      raw = text.split(/[,，、;；]/);
+    }
+  }
+
+  if (!Array.isArray(raw)) return [];
+
+  const seen = new Set();
+  return raw
+    .map(item => String(item || '').trim())
+    .filter(item => {
+      const key = item.toLowerCase();
+      if (!item || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function normalizeHolding(holding) {
+  return {
+    ...holding,
+    sectors: normalizeSectors(holding && holding.sectors),
+  };
+}
+
+function normalizeTrade(trade) {
+  const commission = Number(trade && trade.commission);
+  return {
+    ...trade,
+    commission: Number.isFinite(commission) ? commission : 0,
+    sectors: normalizeSectors(trade && trade.sectors),
+  };
+}
+
+function normalizeQuoteHistory(item) {
+  if (!item) return null;
+  const close = Number(item.close);
+  const date = String(item.date || '').slice(0, 10);
+  const stockCode = requiredString(item.stock_code).toUpperCase();
+
+  if (!stockCode || !date || !Number.isFinite(close) || close <= 0) return null;
+
+  return {
+    stock_code: stockCode,
+    date,
+    close,
+    source: String(item.source || ''),
+    observed_at: String(item.observed_at || item.created_at || new Date().toISOString()),
   };
 }
 
@@ -60,7 +127,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
   function ensureJsonStore() {
     fs.mkdirSync(dataDir, { recursive: true });
     if (!fs.existsSync(dataFile)) {
-      writeJsonStore({ holdings: [], trades: [], fund_flows: [] });
+      writeJsonStore({ holdings: [], trades: [], fund_flows: [], quote_history: [] });
     }
   }
 
@@ -109,6 +176,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
         id TEXT PRIMARY KEY,
         stock_code TEXT NOT NULL UNIQUE,
         stock_name TEXT NOT NULL DEFAULT '',
+        sectors TEXT DEFAULT '[]',
         quantity INTEGER NOT NULL DEFAULT 0,
         cost_price REAL NOT NULL DEFAULT 0,
         total_cost REAL NOT NULL DEFAULT 0,
@@ -127,9 +195,11 @@ function createStorage({ dataDir, dataFile, isProduction }) {
         id TEXT PRIMARY KEY,
         stock_code TEXT NOT NULL,
         stock_name TEXT NOT NULL DEFAULT '',
+        sectors TEXT DEFAULT '[]',
         trade_type TEXT NOT NULL CHECK(trade_type IN ('buy', 'sell')),
         quantity INTEGER NOT NULL CHECK(quantity > 0),
         price REAL NOT NULL CHECK(price > 0),
+        commission REAL NOT NULL DEFAULT 0,
         trade_time TEXT NOT NULL,
         note TEXT DEFAULT '',
         created_by TEXT,
@@ -147,9 +217,19 @@ function createStorage({ dataDir, dataFile, isProduction }) {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS quote_history (
+        stock_code TEXT NOT NULL,
+        date TEXT NOT NULL,
+        close REAL NOT NULL CHECK(close > 0),
+        source TEXT DEFAULT '',
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (stock_code, date)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_trades_stock_code ON trades(stock_code);
       CREATE INDEX IF NOT EXISTS idx_trades_trade_time ON trades(trade_time);
       CREATE INDEX IF NOT EXISTS idx_fund_flows_flow_date ON fund_flows(flow_date);
+      CREATE INDEX IF NOT EXISTS idx_quote_history_date ON quote_history(date);
     `);
 
     ensureSqliteColumns();
@@ -158,7 +238,8 @@ function createStorage({ dataDir, dataFile, isProduction }) {
 
   function ensureSqliteColumns() {
     const holdingColumns = querySql('PRAGMA table_info(holdings);').map(column => column.name);
-    const desiredColumns = [
+    const desiredHoldingColumns = [
+      ['sectors', "TEXT DEFAULT '[]'"],
       ['quote_symbol', 'TEXT'],
       ['quote_source', 'TEXT'],
       ['quote_time', 'TEXT'],
@@ -167,9 +248,21 @@ function createStorage({ dataDir, dataFile, isProduction }) {
       ['quote_updated_at', 'TEXT'],
     ];
 
-    desiredColumns.forEach(([name, definition]) => {
+    desiredHoldingColumns.forEach(([name, definition]) => {
       if (!holdingColumns.includes(name)) {
         runSql(`ALTER TABLE holdings ADD COLUMN ${name} ${definition};`);
+      }
+    });
+
+    const tradeColumns = querySql('PRAGMA table_info(trades);').map(column => column.name);
+    const desiredTradeColumns = [
+      ['sectors', "TEXT DEFAULT '[]'"],
+      ['commission', 'REAL NOT NULL DEFAULT 0'],
+    ];
+
+    desiredTradeColumns.forEach(([name, definition]) => {
+      if (!tradeColumns.includes(name)) {
+        runSql(`ALTER TABLE trades ADD COLUMN ${name} ${definition};`);
       }
     });
   }
@@ -182,13 +275,20 @@ function createStorage({ dataDir, dataFile, isProduction }) {
       SELECT
         (SELECT COUNT(*) FROM holdings) AS holdings,
         (SELECT COUNT(*) FROM trades) AS trades,
-        (SELECT COUNT(*) FROM fund_flows) AS fund_flows;
+        (SELECT COUNT(*) FROM fund_flows) AS fund_flows,
+        (SELECT COUNT(*) FROM quote_history) AS quote_history;
     `)[0] || { holdings: 0, trades: 0, fund_flows: 0 };
 
-    if (Number(counts.holdings) + Number(counts.trades) + Number(counts.fund_flows) > 0) return;
+    if (
+      Number(counts.holdings) +
+      Number(counts.trades) +
+      Number(counts.fund_flows) +
+      Number(counts.quote_history || 0) >
+      0
+    ) return;
 
     const store = readJsonStore();
-    if (store.holdings.length + store.trades.length + store.fund_flows.length === 0) return;
+    if (store.holdings.length + store.trades.length + store.fund_flows.length + store.quote_history.length === 0) return;
 
     writeSqliteStore(store);
     console.log(`[stock-app] imported JSON data from ${dataFile} into ${dbFile}`);
@@ -200,6 +300,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
         id,
         stock_code,
         stock_name,
+        sectors,
         quantity,
         cost_price,
         total_cost,
@@ -221,9 +322,11 @@ function createStorage({ dataDir, dataFile, isProduction }) {
         id,
         stock_code,
         stock_name,
+        sectors,
         trade_type,
         quantity,
         price,
+        commission,
         trade_time,
         note,
         created_by,
@@ -244,7 +347,17 @@ function createStorage({ dataDir, dataFile, isProduction }) {
       FROM fund_flows;
     `);
 
-    return normalizeStore({ holdings, trades, fund_flows: fundFlows });
+    const quoteHistory = querySql(`
+      SELECT
+        stock_code,
+        date,
+        close,
+        source,
+        observed_at
+      FROM quote_history;
+    `);
+
+    return normalizeStore({ holdings, trades, fund_flows: fundFlows, quote_history: quoteHistory });
   }
 
   function writeSqliteStore(store) {
@@ -252,6 +365,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
     const statements = [
       'PRAGMA foreign_keys=OFF;',
       'BEGIN IMMEDIATE;',
+      'DELETE FROM quote_history;',
       'DELETE FROM fund_flows;',
       'DELETE FROM trades;',
       'DELETE FROM holdings;',
@@ -264,6 +378,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
           id,
           stock_code,
           stock_name,
+          sectors,
           quantity,
           cost_price,
           total_cost,
@@ -280,6 +395,7 @@ function createStorage({ dataDir, dataFile, isProduction }) {
           ${sqlString(holding.id || crypto.randomUUID())},
           ${sqlString(requiredString(holding.stock_code))},
           ${sqlString(holding.stock_name || '')},
+          ${sqlString(JSON.stringify(normalizeSectors(holding.sectors)))},
           ${sqlInteger(Number(holding.quantity))},
           ${sqlNumber(holding.cost_price)},
           ${sqlNumber(holding.total_cost)},
@@ -303,9 +419,11 @@ function createStorage({ dataDir, dataFile, isProduction }) {
           id,
           stock_code,
           stock_name,
+          sectors,
           trade_type,
           quantity,
           price,
+          commission,
           trade_time,
           note,
           created_by,
@@ -314,9 +432,11 @@ function createStorage({ dataDir, dataFile, isProduction }) {
           ${sqlString(trade.id || crypto.randomUUID())},
           ${sqlString(requiredString(trade.stock_code))},
           ${sqlString(trade.stock_name || '')},
+          ${sqlString(JSON.stringify(normalizeSectors(trade.sectors)))},
           ${sqlString(trade.trade_type)},
           ${sqlInteger(Number(trade.quantity))},
           ${sqlNumber(trade.price)},
+          ${sqlNumber(trade.commission)},
           ${sqlString(trade.trade_time)},
           ${sqlString(trade.note || '')},
           ${sqlString(trade.created_by)},
@@ -346,6 +466,24 @@ function createStorage({ dataDir, dataFile, isProduction }) {
           ${sqlString(fundFlow.flow_date)},
           ${sqlString(fundFlow.created_by)},
           ${sqlString(fundFlow.created_at || now)}
+        );
+      `);
+    });
+
+    normalized.quote_history.forEach(item => {
+      statements.push(`
+        INSERT INTO quote_history (
+          stock_code,
+          date,
+          close,
+          source,
+          observed_at
+        ) VALUES (
+          ${sqlString(item.stock_code)},
+          ${sqlString(item.date)},
+          ${sqlNumber(item.close)},
+          ${sqlString(item.source || '')},
+          ${sqlString(item.observed_at || new Date().toISOString())}
         );
       `);
     });

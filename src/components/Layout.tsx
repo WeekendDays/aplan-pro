@@ -7,11 +7,11 @@ interface LayoutProps {
   onLogout: () => void;
 }
 
-const navItems = [
-  { to: '/holdings', label: '持仓', icon: '⌁' },
-  { to: '/trades', label: '交易', icon: '↻' },
-  { to: '/pnl', label: '盈亏', icon: '▦' },
-  { to: '/funds', label: '资金', icon: '◌' },
+const navItems: Array<{ to: string; label: string; icon: string }> = [
+  { to: '/holdings', label: '持仓', icon: '▣' },
+  { to: '/trades', label: '交易', icon: '⇄' },
+  { to: '/pnl', label: '分析', icon: '↗' },
+  { to: '/funds', label: '资金', icon: '$' },
 ];
 
 export default function Layout({ currentUser, onLogout }: LayoutProps) {
@@ -20,18 +20,9 @@ export default function Layout({ currentUser, onLogout }: LayoutProps) {
       <aside className="sidebar">
         <div className="sidebar-top">
           <div className="brand-block">
-            <div className="brand-mark">⌁</div>
-            <div>
-              <strong>Stock Portfolio</strong>
-              <span>Portfolio Console</span>
-            </div>
-          </div>
-
-          <div className="user-panel">
-            <div className="user-avatar">{(currentUser.name || currentUser.id || 'U').slice(0, 1)}</div>
-            <div>
-              <strong>{currentUser.name || currentUser.id}</strong>
-              <span>{currentUser.role === 'operator' ? 'Operator' : 'Viewer'}</span>
+            <div className="brand-logo" aria-hidden="true" />
+            <div className="brand-text-lockup">
+              <span className="brand-wordmark" role="img" aria-label="Aplan" />
             </div>
           </div>
         </div>
@@ -40,7 +31,7 @@ export default function Layout({ currentUser, onLogout }: LayoutProps) {
           {navItems.map(item => (
             <NavLink
               className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}
-              key={item.to}
+              key={item.label}
               to={item.to}
             >
               <span>{item.icon}</span>
@@ -49,7 +40,12 @@ export default function Layout({ currentUser, onLogout }: LayoutProps) {
           ))}
         </nav>
 
-        <button className="logout-button" onClick={onLogout} type="button">
+        <button
+          className="logout-button"
+          onClick={onLogout}
+          title={`退出 ${currentUser.name || currentUser.id}`}
+          type="button"
+        >
           <span>↪</span>
           退出登录
         </button>

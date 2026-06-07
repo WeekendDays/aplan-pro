@@ -4,6 +4,8 @@ const http = require('http');
 const path = require('path');
 const { createStorage } = require('./storage');
 
+loadLocalEnv();
+
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '127.0.0.1';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -14,14 +16,54 @@ const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true';
 const QUOTE_REFRESH_TIMEOUT_MS = Number(process.env.QUOTE_REFRESH_TIMEOUT_MS || 10000);
+const NAV_HISTORY_TIMEOUT_MS = Number(process.env.NAV_HISTORY_TIMEOUT_MS || 8000);
 const PRICE_SYMBOL_MAP = process.env.PRICE_SYMBOL_MAP ? JSON.parse(process.env.PRICE_SYMBOL_MAP) : {};
+const ALPACA_API_KEY_ID = process.env.ALPACA_API_KEY_ID || process.env.ALPACA_KEY || '';
+const ALPACA_API_SECRET_KEY = process.env.ALPACA_API_SECRET_KEY || process.env.ALPACA_SECRET || '';
+const ALPACA_SYMBOL_MAP = process.env.ALPACA_SYMBOL_MAP ? JSON.parse(process.env.ALPACA_SYMBOL_MAP) : {};
+const ALPACA_DATA_FEED = process.env.ALPACA_DATA_FEED || 'iex';
+const ALPACA_DATA_ADJUSTMENT = process.env.ALPACA_DATA_ADJUSTMENT || 'raw';
+const ALPACA_DATA_BASE_URL = normalizeAlpacaBaseUrl(
+  process.env.ALPACA_DATA_BASE_URL || process.env.ALPACA_MARKET_DATA_ENDPOINT || process.env.ALPACA_ENDPOINT,
+);
+const ALPACA_QUOTE_TIMEOUT_MS = Number(process.env.ALPACA_QUOTE_TIMEOUT_MS || QUOTE_REFRESH_TIMEOUT_MS);
+const ALPACA_HISTORY_TIMEOUT_MS = Number(process.env.ALPACA_HISTORY_TIMEOUT_MS || NAV_HISTORY_TIMEOUT_MS);
+const NAV_CACHE_TTL_MS = Math.max(0, Number(process.env.NAV_CACHE_TTL_MS || 10 * 60 * 1000));
 const LOGIN_RATE_LIMIT_WINDOW_MS = Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 10);
 const storage = createStorage({ dataDir: DATA_DIR, dataFile: DATA_FILE, isProduction: IS_PRODUCTION });
 
 const loginAttempts = new Map();
+const portfolioNavCache = new Map();
+const portfolioNavInflight = new Map();
+const providerWarnings = new Set();
 const users = loadUsers();
 validateProductionConfig();
+
+function loadLocalEnv() {
+  ['.env.local', '.env'].forEach(fileName => {
+    const filePath = path.resolve(process.cwd(), fileName);
+    if (!fs.existsSync(filePath)) return;
+
+    fs.readFileSync(filePath, 'utf8').split(/\r?\n/).forEach(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return;
+      const index = trimmed.indexOf('=');
+      if (index < 0) return;
+
+      const key = trimmed.slice(0, index).trim();
+      let value = trimmed.slice(index + 1).trim();
+      if (!key || process.env[key] !== undefined) return;
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    });
+  });
+}
 
 function loadUsers() {
   if (process.env.STOCK_APP_USERNAME && process.env.STOCK_APP_PASSWORD) {
@@ -80,6 +122,7 @@ function readStore() {
 
 function writeStore(store) {
   storage.write(store);
+  clearPortfolioNavCache();
 }
 
 function sendJson(res, status, payload, headers = {}) {
@@ -284,32 +327,258 @@ function numberFrom(value, field) {
   return number;
 }
 
+function optionalNumberFrom(value, field, fallback = 0) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return numberFrom(value, field);
+}
+
+function normalizeSectors(value) {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set();
+  return value
+    .map(item => String(item || '').trim())
+    .filter(item => {
+      const key = item.toLowerCase();
+      if (!item || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 function sortByDateDesc(items, field) {
   return [...items].sort((a, b) => new Date(b[field]).getTime() - new Date(a[field]).getTime());
+}
+
+function dateKey(value) {
+  if (!value) return '';
+  const text = String(value);
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString().slice(0, 10);
+}
+
+function utcDate(key) {
+  return new Date(`${key}T00:00:00.000Z`);
+}
+
+function addDays(key, days) {
+  const date = utcDate(key);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function compareDateKeys(a, b) {
+  return a.localeCompare(b);
+}
+
+function isWeekend(key) {
+  const day = utcDate(key).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function previousTradingDate(key) {
+  let current = addDays(key, -1);
+  while (isWeekend(current)) current = addDays(current, -1);
+  return current;
+}
+
+function rangeStartDate(range, latestDate) {
+  if (range === '1D') return previousTradingDate(latestDate);
+  if (range === '7D') return addDays(latestDate, -6);
+  if (range === '1M') return addDays(latestDate, -30);
+  if (range === 'YTD') return `${latestDate.slice(0, 4)}-01-01`;
+  return addDays(latestDate, -6);
+}
+
+function normalizePerformanceRange(range) {
+  return ['1D', '7D', '1M', 'YTD'].includes(range) ? range : '7D';
+}
+
+function clearPortfolioNavCache() {
+  portfolioNavCache.clear();
+}
+
+function prunePortfolioNavCache(now = Date.now()) {
+  portfolioNavCache.forEach((entry, key) => {
+    if (!entry || entry.expiresAt <= now) portfolioNavCache.delete(key);
+  });
+
+  while (portfolioNavCache.size > 16) {
+    const oldestKey = portfolioNavCache.keys().next().value;
+    if (!oldestKey) break;
+    portfolioNavCache.delete(oldestKey);
+  }
+}
+
+function portfolioNavCacheKey(range, version) {
+  return `${range}:${version}`;
+}
+
+function portfolioNavCacheVersion(store) {
+  const payload = {
+    asOfDate: dateKey(new Date()),
+    fund_flows: [...(store.fund_flows || [])]
+      .map(flow => [
+        flow.id,
+        flow.flow_type,
+        Number(flow.amount) || 0,
+        Number(flow.balance_after) || 0,
+        dateKey(flow.flow_date),
+        flow.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    holdings: [...(store.holdings || [])]
+      .map(holding => [
+        String(holding.stock_code || '').toUpperCase(),
+        Number(holding.current_price) || 0,
+        Number(holding.quote_change) || 0,
+        dateKey(holding.quote_time || holding.quote_updated_at || holding.updated_at),
+        holding.quote_source || '',
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    quote_history: ensureQuoteHistory(store)
+      .map(item => [
+        String(item.stock_code || '').toUpperCase(),
+        dateKey(item.date),
+        Number(item.close) || 0,
+      ])
+      .filter(item => item[0] && item[1] && item[2] > 0)
+      .sort((a, b) => `${a[0]}:${a[1]}`.localeCompare(`${b[0]}:${b[1]}`)),
+    trades: [...(store.trades || [])]
+      .map(trade => [
+        trade.id,
+        String(trade.stock_code || '').toUpperCase(),
+        trade.trade_type,
+        Number(trade.quantity) || 0,
+        Number(trade.price) || 0,
+        Number(trade.commission) || 0,
+        dateKey(trade.trade_time),
+        trade.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  };
+
+  return crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex');
+}
+
+function enumerateValuationDates(startDate, endDate, eventDates = new Set()) {
+  const dates = [];
+  for (let current = startDate; compareDateKeys(current, endDate) <= 0; current = addDays(current, 1)) {
+    if (!isWeekend(current) || eventDates.has(current)) dates.push(current);
+  }
+  return dates;
+}
+
+function ensureQuoteHistory(store) {
+  if (!Array.isArray(store.quote_history)) store.quote_history = [];
+  return store.quote_history;
+}
+
+function upsertQuoteHistory(store, item, options = {}) {
+  const stockCode = String(item.stock_code || '').trim().toUpperCase();
+  const date = dateKey(item.date);
+  const close = Number(item.close);
+  if (!stockCode || !date || !Number.isFinite(close) || close <= 0) return false;
+
+  const history = ensureQuoteHistory(store);
+  const existing = history.find(row => row.stock_code === stockCode && row.date === date);
+  const shouldPreserveProviderRow =
+    existing &&
+    options.preserveProviderRow &&
+    !String(existing.source || '').includes('holding');
+  const next = {
+    stock_code: stockCode,
+    date,
+    close,
+    source: String(item.source || ''),
+    observed_at: String(item.observed_at || new Date().toISOString()),
+  };
+
+  if (existing) {
+    if (shouldPreserveProviderRow) return false;
+
+    if (
+      Number(existing.close) === close &&
+      String(existing.source || '') === next.source &&
+      String(existing.observed_at || '') === next.observed_at
+    ) {
+      return false;
+    }
+
+    Object.assign(existing, next);
+    return true;
+  }
+
+  history.push(next);
+  return true;
+}
+
+function seedQuoteHistoryFromHoldings(store) {
+  let changed = false;
+  ensureQuoteHistory(store);
+
+  store.holdings.forEach(holding => {
+    const currentPrice = Number(holding.current_price);
+    const quoteDate = dateKey(holding.quote_time || holding.quote_updated_at || holding.updated_at);
+    if (!quoteDate || !Number.isFinite(currentPrice) || currentPrice <= 0) return;
+
+    changed = upsertQuoteHistory(store, {
+      stock_code: holding.stock_code,
+      date: quoteDate,
+      close: currentPrice,
+      source: holding.quote_source || 'holding-current',
+      observed_at: holding.quote_updated_at || holding.updated_at || new Date().toISOString(),
+    }, { preserveProviderRow: true }) || changed;
+
+    const quoteChange = Number(holding.quote_change);
+    const previousClose = currentPrice - quoteChange;
+    if (Number.isFinite(quoteChange) && quoteChange !== 0 && previousClose > 0) {
+      changed = upsertQuoteHistory(store, {
+        stock_code: holding.stock_code,
+        date: previousTradingDate(quoteDate),
+        close: previousClose,
+        source: `${holding.quote_source || 'holding'}-previous-close`,
+        observed_at: holding.quote_updated_at || holding.updated_at || new Date().toISOString(),
+      }, { preserveProviderRow: true }) || changed;
+    }
+  });
+
+  return changed;
 }
 
 function updateHoldingsForTrade(store, trade) {
   const existing = store.holdings.find(holding => holding.stock_code === trade.stock_code);
   const now = new Date().toISOString();
+  const commission = Number(trade.commission || 0);
+  const grossAmount = trade.quantity * trade.price;
+  const tradeSectors = normalizeSectors(trade.sectors);
+
+  function syncStockProfile(holding) {
+    holding.stock_name = trade.stock_name || holding.stock_name;
+    if (tradeSectors.length > 0) holding.sectors = tradeSectors;
+    holding.updated_at = now;
+  }
 
   if (trade.trade_type === 'buy') {
     if (existing) {
       const newQty = Number(existing.quantity) + trade.quantity;
-      const newCost = Number(existing.total_cost) + trade.quantity * trade.price;
+      const newCost = Number(existing.total_cost) + grossAmount + commission;
       existing.quantity = newQty;
       existing.total_cost = newCost;
       existing.cost_price = newCost / newQty;
       existing.current_price = Number(existing.current_price || trade.price);
-      existing.stock_name = trade.stock_name || existing.stock_name;
-      existing.updated_at = now;
+      syncStockProfile(existing);
     } else {
       store.holdings.push({
         id: crypto.randomUUID(),
         stock_code: trade.stock_code,
         stock_name: trade.stock_name,
+        sectors: tradeSectors,
         quantity: trade.quantity,
-        cost_price: trade.price,
-        total_cost: trade.quantity * trade.price,
+        cost_price: (grossAmount + commission) / trade.quantity,
+        total_cost: grossAmount + commission,
         current_price: trade.price,
         updated_at: now,
         created_at: now,
@@ -325,7 +594,7 @@ function updateHoldingsForTrade(store, trade) {
   } else {
     existing.quantity = newQty;
     existing.total_cost = Number(existing.cost_price) * newQty;
-    existing.updated_at = now;
+    syncStockProfile(existing);
   }
 }
 
@@ -354,6 +623,238 @@ function normalizeTencentSymbol(stockCode) {
     .replace(/\.OQ$/, '')
     .replace(/\.N$/, '');
   return `us${usCode}`;
+}
+
+function warnProviderOnce(key, error) {
+  if (providerWarnings.has(key)) return;
+  providerWarnings.add(key);
+  console.warn(`[stock-app] ${key}: ${error && error.message ? error.message : error}`);
+}
+
+function normalizeAlpacaBaseUrl(value) {
+  const fallback = 'https://data.alpaca.markets/v2';
+  const candidate = String(value || '').trim();
+  if (!candidate) return fallback;
+  if (/^https:\/\/(paper-)?api\.alpaca\.markets\/v2\/?$/i.test(candidate)) {
+    return fallback;
+  }
+  if (/^https?:\/\/.+\/v2\/?$/i.test(candidate)) return candidate.replace(/\/+$/, '');
+  return fallback;
+}
+
+function normalizeAlpacaSymbol(stockCode) {
+  const code = String(stockCode || '').trim().toUpperCase();
+  if (ALPACA_SYMBOL_MAP[code]) return ALPACA_SYMBOL_MAP[code];
+  if (!code) return '';
+
+  return code
+    .replace(/\s+/g, '')
+    .replace(/^US/i, '')
+    .replace(/\.US$/i, '')
+    .replace(/\.OQ$/i, '')
+    .replace(/\.N$/i, '');
+}
+
+function alpacaSymbolPairs(stockCodes) {
+  return stockCodes
+    .map(stockCode => ({
+      stockCode: String(stockCode || '').trim().toUpperCase(),
+      quoteSymbol: normalizeAlpacaSymbol(stockCode),
+    }))
+    .filter(item => item.stockCode && item.quoteSymbol);
+}
+
+function alpacaHeaders() {
+  if (!ALPACA_API_KEY_ID || !ALPACA_API_SECRET_KEY) {
+    throw new Error('Alpaca API credentials are not configured');
+  }
+
+  return {
+    Accept: 'application/json',
+    'APCA-API-KEY-ID': ALPACA_API_KEY_ID,
+    'APCA-API-SECRET-KEY': ALPACA_API_SECRET_KEY,
+  };
+}
+
+async function fetchAlpacaJson(pathname, params, timeoutMs) {
+  const url = new URL(pathname.replace(/^\/+/, ''), `${ALPACA_DATA_BASE_URL}/`);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  const response = await fetch(url, {
+    headers: alpacaHeaders(),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.error) {
+    const message = payload.message || payload.error || `Alpaca provider returned ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+function alpacaBarClose(bar) {
+  const close = Number(bar && bar.c);
+  return Number.isFinite(close) && close > 0 ? close : null;
+}
+
+async function fetchAlpacaQuotes(stockCodes) {
+  const symbolPairs = alpacaSymbolPairs(stockCodes);
+  const uniqueSymbols = [...new Set(symbolPairs.map(item => item.quoteSymbol))];
+  if (uniqueSymbols.length === 0) return { quotes: new Map(), symbolPairs };
+
+  const [latestTradesPayload, latestBarsPayload, latestQuotesPayload, recentDailyHistory] = await Promise.all([
+    fetchAlpacaJson(
+      'stocks/trades/latest',
+      { symbols: uniqueSymbols.join(','), feed: ALPACA_DATA_FEED },
+      ALPACA_QUOTE_TIMEOUT_MS,
+    ),
+    fetchAlpacaJson(
+      'stocks/bars/latest',
+      { symbols: uniqueSymbols.join(','), feed: ALPACA_DATA_FEED },
+      ALPACA_QUOTE_TIMEOUT_MS,
+    ),
+    fetchAlpacaJson(
+      'stocks/quotes/latest',
+      { symbols: uniqueSymbols.join(','), feed: ALPACA_DATA_FEED },
+      ALPACA_QUOTE_TIMEOUT_MS,
+    ),
+    fetchAlpacaDailyHistory(
+      stockCodes,
+      addDays(dateKey(new Date()), -14),
+      dateKey(new Date()),
+    ).catch(error => {
+      warnProviderOnce('Alpaca daily bars for quote changes unavailable', error);
+      return [];
+    }),
+  ]);
+  const latestTrades = latestTradesPayload.trades && typeof latestTradesPayload.trades === 'object'
+    ? latestTradesPayload.trades
+    : {};
+  const latestBars = latestBarsPayload.bars && typeof latestBarsPayload.bars === 'object'
+    ? latestBarsPayload.bars
+    : {};
+  const latestQuotes = latestQuotesPayload.quotes && typeof latestQuotesPayload.quotes === 'object'
+    ? latestQuotesPayload.quotes
+    : {};
+  const historyByCode = new Map();
+  recentDailyHistory.forEach(item => {
+    if (!historyByCode.has(item.stock_code)) historyByCode.set(item.stock_code, []);
+    historyByCode.get(item.stock_code).push({ date: item.date, close: item.close });
+  });
+  historyByCode.forEach(rows => rows.sort((a, b) => compareDateKeys(a.date, b.date)));
+
+  function priceInfoForSymbol(quoteSymbol) {
+    const trade = latestTrades[quoteSymbol] || latestTrades[String(quoteSymbol).toUpperCase()];
+    const tradePrice = Number(trade && trade.p);
+    if (Number.isFinite(tradePrice) && tradePrice > 0) {
+      return { price: tradePrice, time: String(trade.t || new Date().toISOString()) };
+    }
+
+    const bar = latestBars[quoteSymbol] || latestBars[String(quoteSymbol).toUpperCase()];
+    const barClose = alpacaBarClose(bar);
+    if (barClose) {
+      return { price: barClose, time: String(bar.t || new Date().toISOString()) };
+    }
+
+    const quote = latestQuotes[quoteSymbol] || latestQuotes[String(quoteSymbol).toUpperCase()];
+    const bid = Number(quote && quote.bp);
+    const ask = Number(quote && quote.ap);
+    if (Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0) {
+      return { price: (bid + ask) / 2, time: String(quote.t || new Date().toISOString()) };
+    }
+
+    return null;
+  }
+
+  function previousCloseForStock(stockCode, quoteDate) {
+    const rows = historyByCode.get(stockCode) || [];
+    let match = null;
+    rows.forEach(row => {
+      if (!quoteDate || compareDateKeys(row.date, quoteDate) < 0) match = row.close;
+    });
+    if (match) return match;
+    return rows.length >= 2 ? rows[rows.length - 2].close : null;
+  }
+
+  const quotes = new Map();
+  symbolPairs.forEach(({ stockCode, quoteSymbol }) => {
+    const priceInfo = priceInfoForSymbol(quoteSymbol);
+    if (!priceInfo) return;
+
+    const quoteDate = dateKey(priceInfo.time);
+    const previousClose = previousCloseForStock(stockCode, quoteDate);
+    const quoteChange = previousClose ? priceInfo.price - previousClose : 0;
+    const quoteChangePercent = previousClose ? (quoteChange / previousClose) * 100 : 0;
+
+    quotes.set(stockCode, {
+      quote_symbol: quoteSymbol,
+      current_price: priceInfo.price,
+      quote_name: '',
+      quote_time: priceInfo.time,
+      quote_change: quoteChange,
+      quote_change_percent: quoteChangePercent,
+      quote_source: `alpaca-${ALPACA_DATA_FEED}`,
+      quote_updated_at: new Date().toISOString(),
+    });
+  });
+
+  return { quotes, symbolPairs };
+}
+
+async function fetchAlpacaDailyHistory(stockCodes, fromDate, toDate) {
+  const updates = [];
+  const symbolPairs = alpacaSymbolPairs(stockCodes);
+  const uniqueSymbols = [...new Set(symbolPairs.map(item => item.quoteSymbol))];
+  if (uniqueSymbols.length === 0) return updates;
+
+  let pageToken = '';
+  const endExclusive = addDays(toDate, 1);
+  const symbolByQuoteSymbol = new Map(symbolPairs.map(item => [item.quoteSymbol, item.stockCode]));
+
+  do {
+    const payload = await fetchAlpacaJson(
+      'stocks/bars',
+      {
+        symbols: uniqueSymbols.join(','),
+        timeframe: '1Day',
+        start: fromDate,
+        end: endExclusive,
+        limit: 10000,
+        adjustment: ALPACA_DATA_ADJUSTMENT,
+        feed: ALPACA_DATA_FEED,
+        page_token: pageToken,
+      },
+      ALPACA_HISTORY_TIMEOUT_MS,
+    );
+    const barsBySymbol = payload.bars && typeof payload.bars === 'object' ? payload.bars : {};
+    Object.entries(barsBySymbol).forEach(([quoteSymbol, rows]) => {
+      const stockCode = symbolByQuoteSymbol.get(quoteSymbol);
+      if (!stockCode || !Array.isArray(rows)) return;
+
+      rows.forEach(row => {
+        const date = dateKey(row && row.t);
+        const close = alpacaBarClose(row);
+        if (!date || compareDateKeys(date, fromDate) < 0 || compareDateKeys(date, toDate) > 0 || !close) return;
+
+        updates.push({
+          stock_code: stockCode,
+          date,
+          close,
+          source: `alpaca-${ALPACA_DATA_FEED}-${ALPACA_DATA_ADJUSTMENT}`,
+          observed_at: new Date().toISOString(),
+        });
+      });
+    });
+    pageToken = String(payload.next_page_token || '');
+  } while (pageToken);
+
+  return updates;
 }
 
 function parseTencentQuotes(rawText) {
@@ -407,16 +908,63 @@ async function fetchTencentQuotes(stockCodes) {
   return { quotes: parseTencentQuotes(text), symbolPairs };
 }
 
+async function fetchTencentDailyHistory(stockCodes, fromDate, toDate) {
+  const updates = [];
+  const symbolPairs = stockCodes
+    .map(stockCode => ({ stockCode, quoteSymbol: normalizeTencentSymbol(stockCode) }))
+    .filter(item => item.quoteSymbol);
+  const uniquePairs = [...new Map(symbolPairs.map(item => [item.stockCode, item])).values()];
+
+  await Promise.all(uniquePairs.map(async ({ stockCode, quoteSymbol }) => {
+    const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${encodeURIComponent(quoteSymbol)},day,${fromDate},${toDate},320,qfq`;
+
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 stock-portfolio/1.0',
+          Referer: 'https://gu.qq.com/',
+          Accept: 'application/json,text/plain,*/*',
+        },
+        signal: AbortSignal.timeout(NAV_HISTORY_TIMEOUT_MS),
+      });
+      if (!response.ok) return;
+
+      const payload = await response.json();
+      const rows = payload && payload.data && payload.data[quoteSymbol] && payload.data[quoteSymbol].day;
+      if (!Array.isArray(rows)) return;
+
+      rows.forEach(row => {
+        if (!Array.isArray(row)) return;
+        const date = dateKey(row[0]);
+        const close = Number(row[2]);
+        if (!date || compareDateKeys(date, fromDate) < 0 || compareDateKeys(date, toDate) > 0) return;
+        if (!Number.isFinite(close) || close <= 0) return;
+
+        updates.push({
+          stock_code: stockCode,
+          date,
+          close,
+          source: 'tencent-history',
+          observed_at: new Date().toISOString(),
+        });
+      });
+    } catch {
+      // Historical data is best effort; cached quotes and trade prices still produce a transparent series.
+    }
+  }));
+
+  return updates;
+}
+
 async function refreshHoldingPrices(store) {
-  const stockCodes = store.holdings.map(holding => holding.stock_code);
-  const { quotes, symbolPairs } = await fetchTencentQuotes(stockCodes);
-  const symbolByCode = new Map(symbolPairs.map(item => [item.stockCode, item.quoteSymbol.toLowerCase()]));
-  const refreshed = [];
+  const stockCodes = store.holdings.map(holding => String(holding.stock_code || '').toUpperCase()).filter(Boolean);
+  const { quotes } = await fetchAlpacaQuotes(stockCodes);
   const failed = [];
+  const refreshed = [];
 
   store.holdings.forEach(holding => {
-    const quoteKey = symbolByCode.get(holding.stock_code);
-    const quote = quoteKey ? quotes.get(quoteKey) : null;
+    const stockCode = String(holding.stock_code || '').toUpperCase();
+    const quote = quotes.get(stockCode);
     if (!quote) {
       failed.push(holding.stock_code);
       return;
@@ -430,6 +978,26 @@ async function refreshHoldingPrices(store) {
     holding.quote_change_percent = quote.quote_change_percent;
     holding.quote_updated_at = quote.quote_updated_at;
     holding.updated_at = quote.quote_updated_at;
+    const quoteDate = dateKey(quote.quote_time || quote.quote_updated_at);
+    upsertQuoteHistory(store, {
+      stock_code: holding.stock_code,
+      date: quoteDate,
+      close: quote.current_price,
+      source: quote.quote_source,
+      observed_at: quote.quote_updated_at,
+    });
+    if (Number.isFinite(Number(quote.quote_change)) && Number(quote.quote_change) !== 0) {
+      const previousClose = quote.current_price - Number(quote.quote_change);
+      if (quoteDate && previousClose > 0) {
+        upsertQuoteHistory(store, {
+          stock_code: holding.stock_code,
+          date: previousTradingDate(quoteDate),
+          close: previousClose,
+          source: `${quote.quote_source}-previous-close`,
+          observed_at: quote.quote_updated_at,
+        });
+      }
+    }
     refreshed.push(holding.stock_code);
   });
 
@@ -443,6 +1011,308 @@ async function refreshHoldingPrices(store) {
     failed,
     refreshed_at: new Date().toISOString(),
   };
+}
+
+function buildQuoteMaps(store) {
+  const byCode = new Map();
+  ensureQuoteHistory(store).forEach(item => {
+    const stockCode = String(item.stock_code || '').toUpperCase();
+    const date = dateKey(item.date);
+    const close = Number(item.close);
+    if (!stockCode || !date || !Number.isFinite(close) || close <= 0) return;
+    if (!byCode.has(stockCode)) byCode.set(stockCode, []);
+    byCode.get(stockCode).push({ date, close });
+  });
+
+  byCode.forEach(rows => rows.sort((a, b) => compareDateKeys(a.date, b.date)));
+  return byCode;
+}
+
+function latestQuotePriceOnOrBefore(quoteMaps, stockCode, date) {
+  const rows = quoteMaps.get(stockCode);
+  if (!rows || rows.length === 0) return null;
+
+  let match = null;
+  for (const row of rows) {
+    if (compareDateKeys(row.date, date) > 0) break;
+    match = row;
+  }
+  return match;
+}
+
+function valuePortfolio({ cash, positions, latestTradePrices, quoteMaps }, date) {
+  let marketValue = 0;
+  let pricedPositions = 0;
+  let quotePricedPositions = 0;
+  let fallbackPricedPositions = 0;
+  let missingPriceCount = 0;
+
+  positions.forEach((quantity, stockCode) => {
+    if (quantity <= 0) return;
+    const quote = latestQuotePriceOnOrBefore(quoteMaps, stockCode, date);
+    const fallbackPrice = latestTradePrices.get(stockCode);
+    const price = quote ? quote.close : fallbackPrice;
+
+    if (!Number.isFinite(price) || price <= 0) {
+      missingPriceCount += 1;
+      return;
+    }
+
+    pricedPositions += 1;
+    if (quote) quotePricedPositions += 1;
+    else fallbackPricedPositions += 1;
+    marketValue += quantity * price;
+  });
+
+  return {
+    cash,
+    fallbackPricedPositions,
+    marketValue,
+    missingPriceCount,
+    pricedPositions,
+    quotePricedPositions,
+    totalAssets: cash + marketValue,
+  };
+}
+
+function adjustPosition(positions, stockCode, delta) {
+  const next = Number(positions.get(stockCode) || 0) + delta;
+  if (Math.abs(next) < 1e-9) positions.delete(stockCode);
+  else positions.set(stockCode, next);
+}
+
+function sortedTradeEvents(trades) {
+  return [...trades]
+    .map(trade => ({ ...trade, date: dateKey(trade.trade_time), time: new Date(trade.trade_time).getTime() }))
+    .filter(trade => trade.date && Number.isFinite(trade.time))
+    .sort((a, b) => a.time - b.time);
+}
+
+function sortedFundFlowEvents(flows) {
+  return [...flows]
+    .map(flow => ({ ...flow, date: dateKey(flow.flow_date), time: new Date(flow.created_at || flow.flow_date).getTime() }))
+    .filter(flow => flow.date && Number.isFinite(flow.time))
+    .sort((a, b) => a.time - b.time);
+}
+
+function buildPortfolioNavSeries(store, range) {
+  const trades = sortedTradeEvents(store.trades || []);
+  const fundFlows = sortedFundFlowEvents(store.fund_flows || []);
+  const quoteMaps = buildQuoteMaps(store);
+  const quoteDates = ensureQuoteHistory(store).map(item => dateKey(item.date)).filter(Boolean);
+  const tradeDates = trades.map(trade => trade.date);
+  const flowDates = fundFlows.map(flow => flow.date);
+  const firstTradeDate = [...tradeDates].sort(compareDateKeys)[0] || '';
+  const firstFlowDate = [...flowDates].sort(compareDateKeys)[0] || '';
+  const allDates = [...quoteDates, ...tradeDates, ...flowDates].sort(compareDateKeys);
+  const latestDate = allDates[allDates.length - 1] || dateKey(new Date());
+  const firstEventDate = [...tradeDates, ...flowDates].sort(compareDateKeys)[0] || latestDate;
+  const startDate = rangeStartDate(range, latestDate);
+  const processStartDate = compareDateKeys(firstEventDate, startDate) < 0 ? firstEventDate : startDate;
+  const eventDates = new Set([...tradeDates, ...flowDates, latestDate]);
+  const valuationDates = enumerateValuationDates(processStartDate, latestDate, eventDates);
+  const inferTradeFlows =
+    fundFlows.length === 0 ||
+    Boolean(firstTradeDate && firstFlowDate && compareDateKeys(firstFlowDate, firstTradeDate) > 0);
+  const state = {
+    cash: 0,
+    latestTradePrices: new Map(),
+    positions: new Map(),
+    quoteMaps,
+    units: 0,
+    lastUnitNav: 1,
+  };
+  const points = [];
+  let tradeIndex = 0;
+  let flowIndex = 0;
+  let totalFallbackPricedPositions = 0;
+  let totalMissingPriceCount = 0;
+  let totalQuotePricedPositions = 0;
+
+  function currentNav(date) {
+    if (state.units <= 0) return state.lastUnitNav || 1;
+    const valuation = valuePortfolio(state, date);
+    return valuation.totalAssets > 0 ? valuation.totalAssets / state.units : state.lastUnitNav || 1;
+  }
+
+  function applyFundFlow(flow) {
+    const amount = Number(flow.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return;
+
+    const nav = currentNav(flow.date);
+    if (flow.flow_type === 'deposit') {
+      state.units += amount / nav;
+      state.cash += amount;
+      return;
+    }
+
+    const unitsToBurn = Math.min(state.units, amount / nav);
+    state.units -= unitsToBurn;
+    state.cash -= amount;
+  }
+
+  function applyTrade(trade) {
+    const stockCode = String(trade.stock_code || '').toUpperCase();
+    const quantity = Number(trade.quantity);
+    const price = Number(trade.price);
+    const commission = Number(trade.commission || 0);
+    if (!stockCode || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) return;
+
+    const grossAmount = quantity * price;
+    state.latestTradePrices.set(stockCode, price);
+
+    if (inferTradeFlows && trade.trade_type === 'buy') {
+      const contribution = grossAmount + commission;
+      const nav = currentNav(trade.date);
+      state.units += contribution / nav;
+      adjustPosition(state.positions, stockCode, quantity);
+      state.lastUnitNav = currentNav(trade.date);
+      return;
+    }
+
+    if (inferTradeFlows && trade.trade_type === 'sell') {
+      const nav = currentNav(trade.date);
+      const proceeds = Math.max(0, grossAmount - commission);
+      adjustPosition(state.positions, stockCode, -quantity);
+      state.units -= Math.min(state.units, proceeds / nav);
+      state.lastUnitNav = state.units > 0 ? currentNav(trade.date) : nav;
+      return;
+    }
+
+    if (trade.trade_type === 'buy') {
+      state.cash -= grossAmount + commission;
+      adjustPosition(state.positions, stockCode, quantity);
+    } else {
+      state.cash += grossAmount - commission;
+      adjustPosition(state.positions, stockCode, -quantity);
+    }
+  }
+
+  valuationDates.forEach(date => {
+    while (flowIndex < fundFlows.length && compareDateKeys(fundFlows[flowIndex].date, date) <= 0) {
+      applyFundFlow(fundFlows[flowIndex]);
+      flowIndex += 1;
+    }
+
+    while (tradeIndex < trades.length && compareDateKeys(trades[tradeIndex].date, date) <= 0) {
+      applyTrade(trades[tradeIndex]);
+      tradeIndex += 1;
+    }
+
+    if (compareDateKeys(date, startDate) < 0 || state.units <= 0) return;
+
+    const valuation = valuePortfolio(state, date);
+    if (valuation.totalAssets <= 0 || valuation.missingPriceCount > 0) {
+      totalMissingPriceCount += valuation.missingPriceCount;
+      return;
+    }
+
+    const unitNav = valuation.totalAssets / state.units;
+    state.lastUnitNav = unitNav;
+    totalFallbackPricedPositions += valuation.fallbackPricedPositions;
+    totalQuotePricedPositions += valuation.quotePricedPositions;
+
+    points.push({
+      cashBalance: Number(valuation.cash.toFixed(4)),
+      date,
+      fallbackPricedPositions: valuation.fallbackPricedPositions,
+      marketValue: Number(valuation.marketValue.toFixed(4)),
+      quotePricedPositions: valuation.quotePricedPositions,
+      totalAssets: Number(valuation.totalAssets.toFixed(4)),
+      unitNav: Number(unitNav.toFixed(6)),
+      units: Number(state.units.toFixed(6)),
+    });
+  });
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const returnRate = first && last ? ((last.unitNav - first.unitNav) / first.unitNav) * 100 : null;
+  const dataNote = totalMissingPriceCount > 0
+    ? '单位净值按交易记录重建；缺失价格的日期已跳过'
+    : totalFallbackPricedPositions > 0
+      ? '单位净值按交易记录重建；部分日期缺少历史收盘价，使用最近成交价估值'
+      : inferTradeFlows && fundFlows.length > 0
+        ? '单位净值按交易记录推断早期资金流，并叠加资金流水和历史收盘价计算'
+        : inferTradeFlows
+          ? '单位净值按交易记录推断资金流，并结合历史收盘价计算'
+          : '单位净值按交易记录、资金流水和历史收盘价计算';
+
+  return {
+    data_note: dataNote,
+    fallback_priced_positions: totalFallbackPricedPositions,
+    generated_at: new Date().toISOString(),
+    infer_trade_flows: inferTradeFlows,
+    latest_date: latestDate,
+    points,
+    quote_priced_positions: totalQuotePricedPositions,
+    range,
+    return_rate: Number.isFinite(returnRate) ? Number(returnRate.toFixed(4)) : null,
+    start_date: startDate,
+  };
+}
+
+async function getPortfolioNav(store, range) {
+  const normalizedRange = normalizePerformanceRange(range);
+  let changed = seedQuoteHistoryFromHoldings(store);
+  if (changed) writeStore(store);
+
+  const now = Date.now();
+  const initialVersion = portfolioNavCacheVersion(store);
+  const initialCacheKey = portfolioNavCacheKey(normalizedRange, initialVersion);
+  const cached = portfolioNavCache.get(initialCacheKey);
+  if (NAV_CACHE_TTL_MS > 0 && cached && cached.expiresAt > now) {
+    return cached.result;
+  }
+
+  const inflight = portfolioNavInflight.get(initialCacheKey);
+  if (inflight) return inflight;
+
+  const request = (async () => {
+    const result = await buildFreshPortfolioNav(store, normalizedRange);
+    if (NAV_CACHE_TTL_MS > 0) {
+      const finalVersion = portfolioNavCacheVersion(store);
+      portfolioNavCache.set(portfolioNavCacheKey(normalizedRange, finalVersion), {
+        expiresAt: Date.now() + NAV_CACHE_TTL_MS,
+        result,
+      });
+      prunePortfolioNavCache();
+    }
+    return result;
+  })();
+
+  portfolioNavInflight.set(initialCacheKey, request);
+  try {
+    return await request;
+  } finally {
+    portfolioNavInflight.delete(initialCacheKey);
+  }
+}
+
+async function buildFreshPortfolioNav(store, normalizedRange) {
+  let changed = false;
+  const allStockCodes = [
+    ...new Set([
+      ...store.holdings.map(item => item.stock_code),
+      ...store.trades.map(item => item.stock_code),
+    ].filter(Boolean).map(item => String(item).toUpperCase())),
+  ];
+  const seededDates = ensureQuoteHistory(store).map(item => dateKey(item.date)).filter(Boolean).sort(compareDateKeys);
+  const latestDate = seededDates[seededDates.length - 1] || dateKey(new Date());
+  const fromDate = rangeStartDate(normalizedRange, latestDate);
+  let historyUpdates = [];
+
+  try {
+    historyUpdates = await fetchAlpacaDailyHistory(allStockCodes, fromDate, latestDate);
+  } catch (error) {
+    warnProviderOnce('Alpaca history provider unavailable; using cached quote history', error);
+  }
+
+  historyUpdates.forEach(item => {
+    changed = upsertQuoteHistory(store, item) || changed;
+  });
+
+  if (changed) writeStore(store);
+  return buildPortfolioNavSeries(store, normalizedRange);
 }
 
 async function handleApi(req, res, url) {
@@ -502,6 +1372,13 @@ async function handleApi(req, res, url) {
       return;
     }
 
+    if (url.pathname === '/api/portfolio/nav' && req.method === 'GET') {
+      const store = readStore();
+      const result = await getPortfolioNav(store, url.searchParams.get('range') || '7D');
+      sendJson(res, 200, result);
+      return;
+    }
+
     const priceMatch = url.pathname.match(/^\/api\/holdings\/([^/]+)\/current-price$/);
     if (priceMatch && req.method === 'PATCH') {
       if (!requireOperator(user, res)) return;
@@ -547,12 +1424,15 @@ async function handleApi(req, res, url) {
       const tradeType = body.trade_type;
       const quantity = numberFrom(body.quantity, 'quantity');
       const price = numberFrom(body.price, 'price');
+      const commission = optionalNumberFrom(body.commission, 'commission', 0);
+      const sectors = normalizeSectors(body.sectors);
       const tradeTime = new Date(body.trade_time);
 
       if (!stockCode || !stockName) throw new Error('stock_code and stock_name are required');
       if (!['buy', 'sell'].includes(tradeType)) throw new Error('trade_type must be buy or sell');
       if (!Number.isInteger(quantity) || quantity <= 0) throw new Error('quantity must be a positive integer');
       if (price <= 0) throw new Error('price must be greater than 0');
+      if (commission < 0) throw new Error('commission must be greater than or equal to 0');
       if (Number.isNaN(tradeTime.getTime())) throw new Error('trade_time is invalid');
 
       const now = new Date().toISOString();
@@ -560,9 +1440,11 @@ async function handleApi(req, res, url) {
         id: crypto.randomUUID(),
         stock_code: stockCode,
         stock_name: stockName,
+        sectors,
         trade_type: tradeType,
         quantity,
         price,
+        commission,
         trade_time: tradeTime.toISOString(),
         note: String(body.note || ''),
         created_by: user.id,

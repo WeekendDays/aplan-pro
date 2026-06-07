@@ -25,6 +25,7 @@ On the server, install the artifact and run the service:
 sudo useradd --system --create-home --home-dir /opt/stock-portfolio --shell /usr/sbin/nologin stockapp
 sudo mkdir -p /opt/stock-portfolio /var/lib/stock-portfolio
 sudo chown -R stockapp:stockapp /opt/stock-portfolio /var/lib/stock-portfolio
+sudo apt-get update && sudo apt-get install -y nodejs sqlite3
 sudo env RESTART_SERVICE=0 bash /tmp/install-artifact.sh /tmp/stock-portfolio-*.tar.gz
 sudo cp /opt/stock-portfolio/current/.env.production.example /etc/stock-portfolio.env
 sudo editor /etc/stock-portfolio.env
@@ -47,10 +48,14 @@ STOCK_APP_USERNAME=operator \
 STOCK_APP_PASSWORD=change-me \
 SESSION_TTL_DAYS=30 \
 SESSION_SECRET=replace-with-a-long-random-string \
+ALPACA_API_KEY_ID=replace-with-your-alpaca-key-id \
+ALPACA_API_SECRET_KEY=replace-with-your-alpaca-secret-key \
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets/v2 \
+ALPACA_DATA_FEED=iex \
 node server/server.js
 ```
 
-The Node server serves `dist/`, exposes authenticated APIs under `/api`, and exposes unauthenticated health checks at `/healthz`.
+The Node server serves `dist/`, exposes authenticated APIs under `/api`, and exposes unauthenticated health checks at `/healthz`. It calls Alpaca Market Data directly for US stock and ETF prices.
 
 For full single-server steps, including no-build updates, use [deploy/README.md](deploy/README.md). It includes:
 
@@ -118,6 +123,12 @@ STOCK_APP_PASSWORD=replace-with-a-strong-password
 SESSION_TTL_DAYS=30
 SESSION_SECRET=replace-with-at-least-32-random-characters
 QUOTE_REFRESH_TIMEOUT_MS=10000
+NAV_HISTORY_TIMEOUT_MS=8000
+ALPACA_API_KEY_ID=replace-with-your-alpaca-key-id
+ALPACA_API_SECRET_KEY=replace-with-your-alpaca-secret-key
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets/v2
+ALPACA_DATA_FEED=iex
+ALPACA_DATA_ADJUSTMENT=raw
 ```
 
 The workflow can be run manually from the GitHub Actions tab. Pushes to `main`
@@ -133,7 +144,7 @@ Recommended production settings:
 - Replace the sample password before sharing the link.
 - Login cookies are long-lived by default: `SESSION_TTL_DAYS=30`. Set `SESSION_SECRET` to a stable random string so sessions survive service restarts and can be invalidated intentionally by rotating the secret.
 - The app uses a single login account. The backend still treats this account as an operator so it can manage trades and fund flows.
-- Holding prices are refreshed by the backend via Tencent quote data. Use `PRICE_SYMBOL_MAP` when a local stock code needs a custom quote symbol, for example `{"BRK.B":"usBRK.B","00700":"hk00700"}`.
+- Holding prices are refreshed by the backend via Alpaca Market Data. Use `ALPACA_SYMBOL_MAP` only when a local stock code needs a custom Alpaca symbol, for example `{"BRK.B":"BRK.B"}`.
 
 ## Data Storage
 

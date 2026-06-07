@@ -30,14 +30,13 @@ export default function Login({ onLogin }: LoginProps) {
   return (
     <main className="login-shell">
       <section className="login-panel" aria-label="登录">
-        <div>
-          <p className="eyebrow">Aplan Portfolio</p>
-          <h1>投资组合工作台</h1>
-          <p className="muted">登录后查看持仓、交易记录、资金流水和盈亏表现。</p>
+        <div className="login-header">
+          <div className="login-logo" aria-hidden="true" />
+          <h1 className="login-wordmark" aria-label="Aplan" />
         </div>
 
         <form className="form-stack" onSubmit={handleSubmit}>
-          <label>
+          <label className="login-field">
             <span>账号</span>
             <input
               autoComplete="username"
@@ -47,7 +46,7 @@ export default function Login({ onLogin }: LoginProps) {
             />
           </label>
 
-          <label>
+          <label className="login-field">
             <span>密码</span>
             <input
               autoComplete="current-password"
@@ -60,7 +59,7 @@ export default function Login({ onLogin }: LoginProps) {
 
           {error && <div className="alert error">{error}</div>}
 
-          <button className="primary-button" disabled={submitting} type="submit">
+          <button className="primary-button login-button" disabled={submitting} type="submit">
             {submitting ? '登录中...' : '登录'}
           </button>
         </form>
