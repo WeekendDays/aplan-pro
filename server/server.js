@@ -11,6 +11,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
 const DATA_FILE = path.resolve(process.env.DATA_FILE || path.join(DATA_DIR, 'store.json'));
+const LOGO_CACHE_DIR = path.resolve(process.env.LOGO_CACHE_DIR || path.join(DATA_DIR, 'logo-cache'));
 const STATIC_DIR = path.resolve(process.env.STATIC_DIR || path.join(process.cwd(), 'dist'));
 const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
@@ -29,6 +30,9 @@ const ALPACA_DATA_BASE_URL = normalizeAlpacaBaseUrl(
 const ALPACA_QUOTE_TIMEOUT_MS = Number(process.env.ALPACA_QUOTE_TIMEOUT_MS || QUOTE_REFRESH_TIMEOUT_MS);
 const ALPACA_HISTORY_TIMEOUT_MS = Number(process.env.ALPACA_HISTORY_TIMEOUT_MS || NAV_HISTORY_TIMEOUT_MS);
 const NAV_CACHE_TTL_MS = Math.max(0, Number(process.env.NAV_CACHE_TTL_MS || 10 * 60 * 1000));
+const LOGO_CACHE_TTL_MS = Math.max(0, Number(process.env.LOGO_CACHE_TTL_MS || 30 * 24 * 60 * 60 * 1000));
+const LOGO_FETCH_TIMEOUT_MS = Number(process.env.LOGO_FETCH_TIMEOUT_MS || 6000);
+const LOGO_MAX_BYTES = Number(process.env.LOGO_MAX_BYTES || 256 * 1024);
 const LOGIN_RATE_LIMIT_WINDOW_MS = Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 10);
 const storage = createStorage({ dataDir: DATA_DIR, dataFile: DATA_FILE, isProduction: IS_PRODUCTION });
@@ -39,6 +43,18 @@ const portfolioNavInflight = new Map();
 const providerWarnings = new Set();
 const users = loadUsers();
 validateProductionConfig();
+
+const LOGO_DOMAINS = {
+  AAPL: 'apple.com',
+  AMAT: 'appliedmaterials.com',
+  AVGO: 'broadcom.com',
+  DRAM: 'globalxetfs.com',
+  NOK: 'nokia.com',
+  NVDA: 'nvidia.com',
+  QLD: 'proshares.com',
+  SMH: 'vaneck.com',
+  VGT: 'vanguard.com',
+};
 
 function loadLocalEnv() {
   ['.env.local', '.env'].forEach(fileName => {
@@ -139,6 +155,16 @@ function sendError(res, status, error) {
   sendJson(res, status, { error });
 }
 
+function sendBinary(res, status, body, contentType, headers = {}) {
+  res.writeHead(status, {
+    'Content-Type': contentType,
+    'Content-Length': body.length,
+    ...securityHeaders(),
+    ...headers,
+  });
+  res.end(body);
+}
+
 function parseCookies(req) {
   const result = {};
   const cookieHeader = req.headers.cookie || '';
@@ -167,6 +193,161 @@ function securityHeaders() {
       "connect-src 'self'",
     ].join('; '),
   };
+}
+
+function normalizeLogoSymbol(value) {
+  const symbol = String(value || '').toUpperCase();
+  if (!/^[A-Z0-9._-]{1,16}$/.test(symbol)) return '';
+  return symbol;
+}
+
+function logoSources(symbol) {
+  const domain = LOGO_DOMAINS[symbol];
+  return [
+    `https://finnhub.io/api/logo?symbol=${encodeURIComponent(symbol)}`,
+    domain ? `https://img.logo.dev/${domain}?size=72` : '',
+  ].filter(Boolean);
+}
+
+function logoCachePaths(symbol) {
+  return {
+    data: path.join(LOGO_CACHE_DIR, `${symbol}.logo`),
+    meta: path.join(LOGO_CACHE_DIR, `${symbol}.json`),
+  };
+}
+
+function detectImageContentType(contentType, body) {
+  if (contentType.startsWith('image/')) return contentType;
+  if (body.length >= 8 && body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return 'image/png';
+  }
+  if (body.length >= 3 && body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (body.length >= 6) {
+    const signature = body.subarray(0, 6).toString('ascii');
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
+  }
+  if (
+    body.length >= 12 &&
+    body.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    body.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  if (body.subarray(0, 512).toString('utf8').trimStart().startsWith('<svg')) {
+    return 'image/svg+xml';
+  }
+
+  return '';
+}
+
+function readCachedLogo(symbol, allowExpired = false) {
+  const { data, meta } = logoCachePaths(symbol);
+  if (!fs.existsSync(data) || !fs.existsSync(meta)) return null;
+
+  try {
+    const metadata = JSON.parse(fs.readFileSync(meta, 'utf8'));
+    if (!allowExpired && Number(metadata.expiresAt || 0) <= Date.now()) return null;
+
+    const body = fs.readFileSync(data);
+    if (body.length <= 0) return null;
+
+    return {
+      body,
+      contentType: typeof metadata.contentType === 'string' ? metadata.contentType : 'image/png',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedLogo(symbol, logo) {
+  fs.mkdirSync(LOGO_CACHE_DIR, { recursive: true });
+  const { data, meta } = logoCachePaths(symbol);
+  fs.writeFileSync(data, logo.body);
+  fs.writeFileSync(meta, JSON.stringify({
+    contentType: logo.contentType,
+    expiresAt: Date.now() + LOGO_CACHE_TTL_MS,
+    source: logo.source,
+    updatedAt: new Date().toISOString(),
+  }));
+}
+
+async function fetchLogoSource(source) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LOGO_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(source, {
+      headers: {
+        Accept: 'image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8',
+        'User-Agent': 'Aplan logo cache/1.0',
+      },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+
+    const rawContentType = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const body = Buffer.from(await response.arrayBuffer());
+    if (body.length <= 0 || body.length > LOGO_MAX_BYTES) return null;
+
+    const contentType = detectImageContentType(rawContentType, body);
+    if (!contentType) return null;
+
+    return { body, contentType, source };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTickerLogo(symbol) {
+  for (const source of logoSources(symbol)) {
+    const logo = await fetchLogoSource(source);
+    if (logo) return logo;
+  }
+
+  return null;
+}
+
+async function sendTickerLogo(res, symbol) {
+  const cached = readCachedLogo(symbol);
+  if (cached) {
+    sendBinary(res, 200, cached.body, cached.contentType, {
+      'Cache-Control': 'public, max-age=604800, immutable',
+      'X-Logo-Cache': 'hit',
+    });
+    return;
+  }
+
+  const fresh = await fetchTickerLogo(symbol);
+  if (fresh) {
+    writeCachedLogo(symbol, fresh);
+    sendBinary(res, 200, fresh.body, fresh.contentType, {
+      'Cache-Control': 'public, max-age=604800, immutable',
+      'X-Logo-Cache': 'miss',
+    });
+    return;
+  }
+
+  const stale = readCachedLogo(symbol, true);
+  if (stale) {
+    sendBinary(res, 200, stale.body, stale.contentType, {
+      'Cache-Control': 'public, max-age=3600',
+      'X-Logo-Cache': 'stale',
+    });
+    return;
+  }
+
+  res.writeHead(404, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'public, max-age=300',
+    ...securityHeaders(),
+  });
+  res.end('Logo not found');
 }
 
 function validateProductionConfig() {
@@ -1425,6 +1606,18 @@ async function handleApi(req, res, url) {
 
     if (url.pathname === '/api/me' && req.method === 'GET') {
       sendJson(res, 200, { user: publicUser(user) });
+      return;
+    }
+
+    const logoMatch = url.pathname.match(/^\/api\/logos\/([^/]+)$/);
+    if (logoMatch && req.method === 'GET') {
+      const symbol = normalizeLogoSymbol(decodeURIComponent(logoMatch[1]));
+      if (!symbol) {
+        sendError(res, 404, 'Logo not found');
+        return;
+      }
+
+      await sendTickerLogo(res, symbol);
       return;
     }
 

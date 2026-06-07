@@ -149,6 +149,17 @@ const logoDomains: Record<string, string> = {
   VGT: 'vanguard.com',
 };
 
+const LOGO_CACHE_PREFIX = 'aplan:ticker-logo:';
+const LOGO_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const LOGO_CACHE_MAX_BYTES = 160 * 1024;
+const logoFetches = new Map<string, Promise<string | null>>();
+
+type LogoCacheEntry = {
+  dataUrl: string;
+  expiresAt: number;
+  source: string;
+};
+
 function getCompanyName(holding: Holding) {
   return companyNames[holding.stock_code.toUpperCase()] || holding.stock_name;
 }
@@ -207,17 +218,128 @@ function logoSources(code: string) {
   const symbol = code.toUpperCase();
   const domain = logoDomains[symbol];
   return [
+    `/api/logos/${encodeURIComponent(symbol)}`,
     `https://finnhub.io/api/logo?symbol=${encodeURIComponent(symbol)}`,
     domain ? `https://img.logo.dev/${domain}?size=72` : '',
     `/assets/logos/${symbol}.png`,
   ].filter(Boolean);
 }
 
+function logoCacheKey(symbol: string) {
+  return `${LOGO_CACHE_PREFIX}${symbol}`;
+}
+
+function readCachedLogo(symbol: string) {
+  if (typeof window === 'undefined') return '';
+
+  try {
+    const raw = window.localStorage.getItem(logoCacheKey(symbol));
+    if (!raw) return '';
+
+    const entry = JSON.parse(raw) as Partial<LogoCacheEntry>;
+    if (typeof entry.dataUrl !== 'string' || typeof entry.expiresAt !== 'number') return '';
+    if (entry.expiresAt <= Date.now()) {
+      window.localStorage.removeItem(logoCacheKey(symbol));
+      return '';
+    }
+
+    return entry.dataUrl;
+  } catch {
+    return '';
+  }
+}
+
+function writeCachedLogo(symbol: string, source: string, dataUrl: string) {
+  if (typeof window === 'undefined') return;
+
+  try {
+    const entry: LogoCacheEntry = {
+      dataUrl,
+      expiresAt: Date.now() + LOGO_CACHE_TTL_MS,
+      source,
+    };
+    window.localStorage.setItem(logoCacheKey(symbol), JSON.stringify(entry));
+  } catch {
+    // Logo caching is an optimization; rendering should continue when storage is full or unavailable.
+  }
+}
+
+function clearCachedLogo(symbol: string) {
+  if (typeof window === 'undefined') return;
+
+  try {
+    window.localStorage.removeItem(logoCacheKey(symbol));
+  } catch {
+    // Ignore storage failures and let the normal fallback chain handle the logo.
+  }
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Logo cache read failed'));
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fetchLogoDataUrl(source: string) {
+  const response = await fetch(source, { cache: 'force-cache', mode: 'cors' });
+  if (!response.ok) return null;
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.startsWith('image/')) return null;
+
+  const blob = await response.blob();
+  if (blob.size <= 0 || blob.size > LOGO_CACHE_MAX_BYTES) return null;
+
+  const dataUrl = await blobToDataUrl(blob);
+  return dataUrl || null;
+}
+
+function cacheLogoSource(symbol: string, source: string) {
+  const key = `${symbol}:${source}`;
+  const existing = logoFetches.get(key);
+  if (existing) return existing;
+
+  const task = fetchLogoDataUrl(source)
+    .then(dataUrl => {
+      if (dataUrl) writeCachedLogo(symbol, source, dataUrl);
+      return dataUrl;
+    })
+    .catch(() => null)
+    .finally(() => {
+      logoFetches.delete(key);
+    });
+
+  logoFetches.set(key, task);
+  return task;
+}
+
 function TickerLogo({ code }: { code: string }) {
   const [sourceIndex, setSourceIndex] = useState(0);
   const symbol = code.toUpperCase();
-  const sources = logoSources(symbol);
-  const currentSource = sources[sourceIndex];
+  const sources = useMemo(() => logoSources(symbol), [symbol]);
+  const [cachedSource, setCachedSource] = useState(() => readCachedLogo(symbol));
+  const currentSource = cachedSource || sources[sourceIndex];
+
+  useEffect(() => {
+    setSourceIndex(0);
+    setCachedSource(readCachedLogo(symbol));
+  }, [symbol]);
+
+  useEffect(() => {
+    if (cachedSource || !currentSource) return undefined;
+
+    let cancelled = false;
+    cacheLogoSource(symbol, currentSource).then(dataUrl => {
+      if (!cancelled && dataUrl) setCachedSource(dataUrl);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cachedSource, currentSource, symbol]);
 
   if (!currentSource) {
     return (
@@ -231,7 +353,17 @@ function TickerLogo({ code }: { code: string }) {
     <span className="ticker-logo">
       <img
         alt={`${symbol} logo`}
-        onError={() => setSourceIndex(index => index + 1)}
+        decoding="async"
+        loading="lazy"
+        onError={() => {
+          if (cachedSource) {
+            clearCachedLogo(symbol);
+            setCachedSource('');
+            return;
+          }
+
+          setSourceIndex(index => index + 1);
+        }}
         src={currentSource}
       />
     </span>
