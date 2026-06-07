@@ -2257,8 +2257,7 @@ label span,
 
 .brand-logo,
 .login-logo {
-  border: 1px solid rgba(34, 197, 94, 0.22);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28), 0 0 0 4px rgba(5, 118, 52, 0.08);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
 }
 
 .nav-link {
@@ -2763,19 +2762,26 @@ tbody tr:hover td {
   }
 
   .app-shell {
-    grid-template-columns: 78px minmax(0, 1fr);
+    display: block;
   }
 
   .sidebar {
     align-items: center;
-    gap: 16px;
-    overflow: hidden;
-    padding: 12px 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    border-right: 0;
+    flex-direction: row;
+    gap: 8px;
+    height: auto;
+    min-height: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 8px 10px;
+    z-index: 10;
   }
 
   .brand-block {
     justify-content: center;
-    width: 44px;
+    width: 36px;
   }
 
   .brand-text-lockup,
@@ -2786,13 +2792,13 @@ tbody tr:hover td {
 
   .brand-logo {
     border-radius: 12px;
-    height: 40px;
-    width: 40px;
+    height: 36px;
+    width: 36px;
   }
 
   .brand-mark {
-    height: 36px;
-    width: 36px;
+    height: 32px;
+    width: 32px;
   }
 
   .user-panel {
@@ -2804,31 +2810,38 @@ tbody tr:hover td {
   }
 
   .nav-list {
-    width: 44px;
+    display: flex;
+    flex: 1 1 auto;
+    gap: 6px;
+    min-width: 0;
+    overflow-x: auto;
+    width: auto;
   }
 
   .nav-link {
-    font-size: 0;
-  }
-
-  .nav-link {
+    flex: 0 0 auto;
+    font-size: 11px;
+    gap: 4px;
     justify-content: center;
-    min-height: 40px;
-    padding: 0;
-    width: 44px;
+    min-height: 36px;
+    min-width: 52px;
+    padding: 0 8px;
+    width: auto;
   }
 
   .nav-link span {
-    font-size: 15px;
+    font-size: 14px;
   }
 
   .logout-button {
+    flex: 0 0 auto;
     font-size: 0;
     justify-content: center;
-    margin-top: auto;
-    min-height: 40px;
+    margin-left: 0;
+    margin-top: 0;
+    min-height: 36px;
     padding: 0;
-    width: 44px;
+    width: 36px;
   }
 
   .logout-button span {
@@ -2836,7 +2849,7 @@ tbody tr:hover td {
   }
 
   .content-area {
-    padding: 18px 12px 26px;
+    padding: 14px 10px 24px;
   }
 
   .page-heading {
@@ -2844,12 +2857,66 @@ tbody tr:hover td {
   }
 
   .page-heading h2 {
-    font-size: 22px;
+    font-size: 20px;
+  }
+
+  .page-subtitle {
+    font-size: 11px;
+    margin-top: 4px;
+  }
+
+  .page-stack {
+    gap: 12px;
+  }
+
+  .metric-card {
+    border-radius: 14px;
+    gap: 8px;
+    min-height: 88px;
+    padding: 12px;
+  }
+
+  .metric-card span,
+  .summary-metric-card span {
+    font-size: 11px;
+  }
+
+  .metric-card strong {
+    font-size: 18px;
+  }
+
+  .metric-corner {
+    bottom: 10px;
+    font-size: 11px;
+    right: 12px;
+  }
+
+  .primary-button,
+  .secondary-button,
+  .ghost-button,
+  .small-button {
+    font-size: 12px;
+    min-height: 32px;
+    padding: 6px 10px;
+  }
+
+  .segmented-control {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .segmented-control button {
+    font-size: 12px;
+    min-height: 28px;
+    padding: 0 10px;
   }
 
   .metric-grid,
   .metric-grid.compact,
-  .holdings-kpi-grid,
+  .holdings-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .form-grid,
   .form-grid.three {
     grid-template-columns: 1fr;
@@ -2866,7 +2933,25 @@ tbody tr:hover td {
   }
 
   .summary-hero-main strong {
-    font-size: 30px;
+    font-size: 24px;
+  }
+
+  .summary-hero-main small {
+    font-size: 11px;
+  }
+
+  .summary-metric-card {
+    min-height: 72px;
+    padding: 10px 10px 24px;
+  }
+
+  .summary-metric-card strong {
+    font-size: 16px;
+  }
+
+  .summary-metric-card small {
+    font-size: 11px;
+    right: 10px;
   }
 
   .trend-card-head {
@@ -2879,11 +2964,37 @@ tbody tr:hover td {
   }
 
   .holdings-table-shell {
+    -webkit-overflow-scrolling: touch;
     overflow-x: auto;
+    overscroll-behavior-x: contain;
+    padding-left: 0;
+    padding-right: 0;
   }
 
   .holdings-table {
     min-width: 900px;
+  }
+
+  .holdings-table th:first-child,
+  .holdings-table td:first-child {
+    left: 0;
+    position: sticky;
+  }
+
+  .holdings-table th:first-child {
+    background: rgba(15, 23, 42, 0.98);
+    z-index: 4;
+  }
+
+  .holdings-table tbody td:first-child {
+    background: rgba(15, 23, 42, 0.98);
+    box-shadow: 10px 0 18px rgba(2, 6, 23, 0.28);
+    z-index: 3;
+  }
+
+  .holdings-table tbody tr:hover td:first-child,
+  .holdings-table tbody tr:focus-visible td:first-child {
+    background: rgba(30, 41, 59, 0.98);
   }
 
   .asset-hero-card {
@@ -2910,12 +3021,27 @@ tbody tr:hover td {
   }
 
   .pnl-calendar-panel {
-    gap: 14px;
-    padding: 14px;
+    border-radius: 14px;
+    gap: 12px;
+    padding: 12px;
   }
 
   .pnl-calendar-head {
     display: grid;
+    gap: 10px;
+  }
+
+  .pnl-calendar-summary {
+    gap: 4px;
+  }
+
+  .pnl-calendar-summary span,
+  .pnl-calendar-summary small {
+    font-size: 11px;
+  }
+
+  .pnl-calendar-summary strong {
+    font-size: 22px;
   }
 
   .pnl-calendar-head .secondary-button {
@@ -2927,34 +3053,60 @@ tbody tr:hover td {
   }
 
   .pnl-month-switcher strong {
-    font-size: 22px;
-    min-height: 40px;
-    min-width: 148px;
-    padding: 0 12px;
+    font-size: 18px;
+    min-height: 36px;
+    min-width: 124px;
+    padding: 0 10px;
+  }
+
+  .pnl-weekdays span {
+    font-size: 11px;
   }
 
   .pnl-weekdays,
   .pnl-calendar-grid {
-    gap: 5px;
+    gap: 4px;
   }
 
   .pnl-calendar-empty,
   .pnl-calendar-day {
-    min-height: 54px;
+    aspect-ratio: 1 / 0.92;
+    min-height: 42px;
   }
 
   .pnl-calendar-day {
-    border-radius: 10px;
-    gap: 4px;
-    padding: 7px 3px;
+    border-radius: 8px;
+    gap: 3px;
+    padding: 6px 2px;
   }
 
   .pnl-calendar-day strong {
-    font-size: 14px;
+    font-size: 12px;
   }
 
   .pnl-calendar-day span {
-    font-size: 10px;
+    font-size: 9px;
+  }
+
+  .pnl-calendar-detail {
+    gap: 6px 10px;
+    justify-content: flex-start;
+    min-height: 0;
+    padding: 8px 10px;
+  }
+
+  .pnl-calendar-detail span {
+    flex-basis: 100%;
+    font-size: 11px;
+    margin-right: 0;
+  }
+
+  .pnl-calendar-detail strong {
+    font-size: 14px;
+  }
+
+  .pnl-calendar-detail small {
+    font-size: 11px;
   }
 
   .trade-month-header {
