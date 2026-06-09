@@ -3,11 +3,12 @@ import {
   getFundFlows,
   getHoldings,
   getPortfolioNav,
+  getTrades,
   refreshHoldingPrices,
   updateHoldingCurrentPrice,
 } from '../lib/database';
-import { normalizeSectors } from '../lib/portfolio';
-import { FundFlow, Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult } from '../lib/types';
+import { calculateCashBalance, normalizeSectors } from '../lib/portfolio';
+import { Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult } from '../lib/types';
 
 const usdFormatter = new Intl.NumberFormat('en-US', {
   currency: 'USD',
@@ -149,6 +150,7 @@ const logoDomains: Record<string, string> = {
   VGT: 'vanguard.com',
 };
 
+const US_MARKET_TIME_ZONE = 'America/New_York';
 const LOGO_CACHE_PREFIX = 'aplan:ticker-logo:';
 const LOGO_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const LOGO_CACHE_MAX_BYTES = 160 * 1024;
@@ -171,18 +173,6 @@ function isEtf(holding: Holding) {
   return etfCodes.has(code) || sectors.includes('ETF') || name.includes('ETF');
 }
 
-function latestCashBalance(flows: FundFlow[]) {
-  if (flows.length === 0) return 0;
-
-  const latest = [...flows].sort((a, b) => {
-    const dateDiff = new Date(b.flow_date).getTime() - new Date(a.flow_date).getTime();
-    if (dateDiff !== 0) return dateDiff;
-    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-  })[0];
-
-  return Number(latest.balance_after || 0);
-}
-
 function formatDateTime(value?: string) {
   if (!value) return '暂无行情时间';
   const date = new Date(value);
@@ -195,6 +185,26 @@ function formatDateTime(value?: string) {
     month: '2-digit',
     timeZone: 'Asia/Shanghai',
   }).format(date);
+}
+
+function marketDateKey(value: string | Date = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+
+  const parts = new Intl.DateTimeFormat('en-US', {
+    day: '2-digit',
+    month: '2-digit',
+    timeZone: US_MARKET_TIME_ZONE,
+    year: 'numeric',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function isCurrentMarketDate(value?: string) {
+  if (!value) return false;
+  return marketDateKey(value) === marketDateKey();
 }
 
 function latestQuoteUpdate(holdings: Holding[]) {
@@ -828,6 +838,7 @@ function deriveHoldingBase(holding: Holding, quoteRefreshFailed = false): Omit<H
     !quoteRefreshFailed &&
     hasValidPrice &&
     quoteChange !== null &&
+    isCurrentMarketDate(holding.quote_time) &&
     Boolean(holding.quote_updated_at || holding.quote_time || holding.quote_source);
   const todayPnl = hasDailyQuote ? quoteChange * quantity : null;
   const previousPrice = hasDailyQuote && currentPrice !== null && quoteChange !== null ? currentPrice - quoteChange : null;
@@ -932,9 +943,13 @@ export default function Holdings() {
 
   async function loadHoldings() {
     setError('');
-    const [data, flows] = await Promise.all([getHoldings(), getFundFlows().catch(() => [])]);
+    const [data, flows, trades] = await Promise.all([
+      getHoldings(),
+      getFundFlows().catch(() => []),
+      getTrades().catch(() => []),
+    ]);
     setHoldings(data);
-    setCashBalance(latestCashBalance(flows));
+    setCashBalance(calculateCashBalance(flows, trades));
     setQuoteFailures(new Set());
   }
 

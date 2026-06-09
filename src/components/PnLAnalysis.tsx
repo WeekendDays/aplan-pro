@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { getFundFlows, getHoldings, getPortfolioNav, getTrades } from '../lib/database';
 import {
+  calculateCashBalance,
+  calculateNetFundFlow,
   calculateRealizedPnl,
   tradeCommission,
 } from '../lib/portfolio';
@@ -139,11 +141,9 @@ export default function PnLAnalysis() {
     const totalPnl = realizedPnl + unrealizedPnl;
     const totalPnlRate = totalBuyCost > 0 ? (totalPnl / totalBuyCost) * 100 : 0;
     const totalCommission = trades.reduce((sum, trade) => sum + tradeCommission(trade), 0);
-    const cashBalance = flows.length > 0 ? Number(flows[0].balance_after) : 0;
+    const cashBalance = calculateCashBalance(flows, trades);
     const netAssets = marketValue + cashBalance;
-    const netCashIn = flows.reduce((sum, flow) => {
-      return sum + (flow.flow_type === 'deposit' ? Number(flow.amount) : -Number(flow.amount));
-    }, 0);
+    const netCashIn = calculateNetFundFlow(flows);
     const assetPnl = netAssets - netCashIn;
 
     return {
