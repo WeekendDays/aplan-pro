@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { FormEvent, useEffect, useId, useMemo, useState } from 'react';
 import {
   getFundFlows,
   getHoldings,
@@ -8,7 +8,7 @@ import {
   updateHoldingCurrentPrice,
 } from '../lib/database';
 import { calculateCashBalance, normalizeSectors } from '../lib/portfolio';
-import { Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult } from '../lib/types';
+import { FundFlow, Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult, Trade } from '../lib/types';
 
 const usdFormatter = new Intl.NumberFormat('en-US', {
   currency: 'USD',
@@ -118,6 +118,177 @@ const filterOptions: Array<{ value: HoldingFilter; label: string }> = [
 ];
 
 const performanceOptions: PerformanceRange[] = ['7D', '1M', 'YTD'];
+const PORTFOLIO_TREND_CACHE_TTL_MS = 10 * 60 * 1000;
+const PORTFOLIO_TREND_CACHE_PREFIX = 'aplan:portfolio-trend:v1:';
+
+type PortfolioTrendCacheEntry = {
+  expiresAt: number;
+  result: PortfolioNavResult;
+};
+
+const portfolioTrendMemoryCache = new Map<string, PortfolioTrendCacheEntry>();
+const portfolioTrendInflight = new Map<string, Promise<PortfolioNavResult>>();
+let portfolioTrendCacheVersion = 0;
+
+function hashText(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function buildPortfolioTrendDataSignature(holdings: Holding[], flows: FundFlow[], trades: Trade[]) {
+  const payload = {
+    flows: flows
+      .map(flow => [
+        flow.id,
+        flow.flow_type,
+        Number(flow.amount) || 0,
+        flow.flow_date,
+        flow.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    holdings: holdings
+      .map(holding => [
+        holding.id,
+        holding.stock_code,
+        Number(holding.quantity) || 0,
+        Number(holding.total_cost) || 0,
+        Number(holding.current_price) || 0,
+        Number(holding.quote_change) || 0,
+        holding.quote_time || '',
+        holding.quote_updated_at || '',
+      ])
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1]))),
+    trades: trades
+      .map(trade => [
+        trade.id,
+        trade.stock_code,
+        trade.trade_type,
+        Number(trade.quantity) || 0,
+        Number(trade.price) || 0,
+        Number(trade.commission) || 0,
+        trade.trade_time,
+        trade.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  };
+
+  return hashText(JSON.stringify(payload));
+}
+
+function portfolioTrendCacheKey(range: PerformanceRange, dataSignature: string) {
+  return `${range}:${dataSignature}`;
+}
+
+function portfolioTrendStorageKey(cacheKey: string) {
+  return `${PORTFOLIO_TREND_CACHE_PREFIX}${cacheKey}`;
+}
+
+function readStoredPortfolioTrend(cacheKey: string) {
+  if (typeof window === 'undefined') return null;
+
+  try {
+    const storageKey = portfolioTrendStorageKey(cacheKey);
+    const raw = window.sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+
+    const entry = JSON.parse(raw) as Partial<PortfolioTrendCacheEntry>;
+    if (!entry.result || !Array.isArray(entry.result.points) || typeof entry.expiresAt !== 'number') {
+      window.sessionStorage.removeItem(storageKey);
+      return null;
+    }
+    if (entry.expiresAt <= Date.now()) {
+      window.sessionStorage.removeItem(storageKey);
+      return null;
+    }
+
+    return entry as PortfolioTrendCacheEntry;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredPortfolioTrend(cacheKey: string, entry: PortfolioTrendCacheEntry) {
+  if (typeof window === 'undefined') return;
+
+  try {
+    window.sessionStorage.setItem(portfolioTrendStorageKey(cacheKey), JSON.stringify(entry));
+  } catch {
+    // The in-memory cache still keeps route changes fast when session storage is unavailable.
+  }
+}
+
+function readPortfolioTrendCache(range: PerformanceRange, dataSignature: string) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const memoryEntry = portfolioTrendMemoryCache.get(cacheKey);
+  if (memoryEntry && memoryEntry.expiresAt > Date.now()) return memoryEntry.result;
+  if (memoryEntry) portfolioTrendMemoryCache.delete(cacheKey);
+
+  const storedEntry = readStoredPortfolioTrend(cacheKey);
+  if (!storedEntry) return null;
+
+  portfolioTrendMemoryCache.set(cacheKey, storedEntry);
+  return storedEntry.result;
+}
+
+function writePortfolioTrendCache(range: PerformanceRange, dataSignature: string, result: PortfolioNavResult) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const entry = {
+    expiresAt: Date.now() + PORTFOLIO_TREND_CACHE_TTL_MS,
+    result,
+  };
+
+  portfolioTrendMemoryCache.set(cacheKey, entry);
+  writeStoredPortfolioTrend(cacheKey, entry);
+}
+
+function clearPortfolioTrendCache() {
+  portfolioTrendCacheVersion += 1;
+  portfolioTrendMemoryCache.clear();
+  portfolioTrendInflight.clear();
+
+  if (typeof window === 'undefined') return;
+
+  try {
+    for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.sessionStorage.key(index);
+      if (key && key.startsWith(PORTFOLIO_TREND_CACHE_PREFIX)) {
+        window.sessionStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // Ignore storage failures; cache misses will simply refetch.
+  }
+}
+
+function loadPortfolioTrend(range: PerformanceRange, dataSignature: string) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const cached = readPortfolioTrendCache(range, dataSignature);
+  if (cached) return Promise.resolve(cached);
+
+  const inflight = portfolioTrendInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const versionAtStart = portfolioTrendCacheVersion;
+  const request = getPortfolioNav(range)
+    .then(result => {
+      if (versionAtStart === portfolioTrendCacheVersion) {
+        writePortfolioTrendCache(range, dataSignature, result);
+      }
+      return result;
+    })
+    .finally(() => {
+      if (portfolioTrendInflight.get(cacheKey) === request) {
+        portfolioTrendInflight.delete(cacheKey);
+      }
+    });
+
+  portfolioTrendInflight.set(cacheKey, request);
+  return request;
+}
 
 const companyNames: Record<string, string> = {
   AAPL: 'Apple Inc.',
@@ -944,7 +1115,7 @@ export default function Holdings() {
   const [navLoading, setNavLoading] = useState(false);
   const [navError, setNavError] = useState('');
   const [navReloadKey, setNavReloadKey] = useState(0);
-  const navCacheRef = useRef(new Map<PerformanceRange, PortfolioNavResult>());
+  const [portfolioDataSignature, setPortfolioDataSignature] = useState('');
 
   async function loadHoldings() {
     setError('');
@@ -955,6 +1126,7 @@ export default function Holdings() {
     ]);
     setHoldings(data);
     setCashBalance(calculateCashBalance(flows, trades));
+    setPortfolioDataSignature(buildPortfolioTrendDataSignature(data, flows, trades));
     setQuoteFailures(new Set());
   }
 
@@ -985,7 +1157,16 @@ export default function Holdings() {
   useEffect(() => {
     let cancelled = false;
     setNavError('');
-    const cached = navCacheRef.current.get(performanceRange);
+
+    if (!portfolioDataSignature) {
+      setNavResult(null);
+      setNavLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const cached = readPortfolioTrendCache(performanceRange, portfolioDataSignature);
     if (cached) {
       setNavResult(cached);
       setNavLoading(false);
@@ -996,9 +1177,8 @@ export default function Holdings() {
 
     setNavLoading(true);
 
-    getPortfolioNav(performanceRange)
+    loadPortfolioTrend(performanceRange, portfolioDataSignature)
       .then(result => {
-        navCacheRef.current.set(performanceRange, result);
         if (!cancelled) setNavResult(result);
       })
       .catch(err => {
@@ -1011,7 +1191,7 @@ export default function Holdings() {
     return () => {
       cancelled = true;
     };
-  }, [navReloadKey, performanceRange]);
+  }, [navReloadKey, performanceRange, portfolioDataSignature]);
 
   const filteredAndSortedMetrics = useMemo(() => {
     const filtered = metrics.filter(metric => {
@@ -1058,7 +1238,7 @@ export default function Holdings() {
         });
       }
       setNavReloadKey(value => value + 1);
-      navCacheRef.current.clear();
+      clearPortfolioTrendCache();
     } catch (err) {
       setRefreshStatus({
         text: err instanceof Error ? err.message : '行情刷新失败',
@@ -1090,7 +1270,7 @@ export default function Holdings() {
       setHoldings(items => items.map(item => (item.id === updated.id ? updated : item)));
       setEditingId('');
       setMessage(`${holding.stock_code} 现价已更新`);
-      navCacheRef.current.clear();
+      clearPortfolioTrendCache();
       setNavReloadKey(value => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : '现价更新失败');
