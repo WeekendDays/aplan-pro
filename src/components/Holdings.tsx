@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { FormEvent, useEffect, useId, useMemo, useState } from 'react';
 import {
   getFundFlows,
   getHoldings,
@@ -8,7 +8,7 @@ import {
   updateHoldingCurrentPrice,
 } from '../lib/database';
 import { calculateCashBalance, normalizeSectors } from '../lib/portfolio';
-import { Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult } from '../lib/types';
+import { FundFlow, Holding, PerformanceRange, PortfolioNavPoint, PortfolioNavResult, Trade } from '../lib/types';
 
 const usdFormatter = new Intl.NumberFormat('en-US', {
   currency: 'USD',
@@ -37,11 +37,6 @@ function percent(value: number | null | undefined, signed = true) {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   const prefix = signed && value > 0 ? '+' : '';
   return `${prefix}${value.toFixed(2)}%`;
-}
-
-function unitNav(value: number | null | undefined) {
-  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
-  return value.toFixed(4);
 }
 
 function formatShares(value: number | null) {
@@ -122,7 +117,178 @@ const filterOptions: Array<{ value: HoldingFilter; label: string }> = [
   { value: 'loss', label: '亏损' },
 ];
 
-const performanceOptions: PerformanceRange[] = ['1D', '7D', '1M', 'YTD'];
+const performanceOptions: PerformanceRange[] = ['7D', '1M', 'YTD'];
+const PORTFOLIO_TREND_CACHE_TTL_MS = 10 * 60 * 1000;
+const PORTFOLIO_TREND_CACHE_PREFIX = 'aplan:portfolio-trend:v1:';
+
+type PortfolioTrendCacheEntry = {
+  expiresAt: number;
+  result: PortfolioNavResult;
+};
+
+const portfolioTrendMemoryCache = new Map<string, PortfolioTrendCacheEntry>();
+const portfolioTrendInflight = new Map<string, Promise<PortfolioNavResult>>();
+let portfolioTrendCacheVersion = 0;
+
+function hashText(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function buildPortfolioTrendDataSignature(holdings: Holding[], flows: FundFlow[], trades: Trade[]) {
+  const payload = {
+    flows: flows
+      .map(flow => [
+        flow.id,
+        flow.flow_type,
+        Number(flow.amount) || 0,
+        flow.flow_date,
+        flow.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    holdings: holdings
+      .map(holding => [
+        holding.id,
+        holding.stock_code,
+        Number(holding.quantity) || 0,
+        Number(holding.total_cost) || 0,
+        Number(holding.current_price) || 0,
+        Number(holding.quote_change) || 0,
+        holding.quote_time || '',
+        holding.quote_updated_at || '',
+      ])
+      .sort((a, b) => String(a[1]).localeCompare(String(b[1]))),
+    trades: trades
+      .map(trade => [
+        trade.id,
+        trade.stock_code,
+        trade.trade_type,
+        Number(trade.quantity) || 0,
+        Number(trade.price) || 0,
+        Number(trade.commission) || 0,
+        trade.trade_time,
+        trade.created_at,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  };
+
+  return hashText(JSON.stringify(payload));
+}
+
+function portfolioTrendCacheKey(range: PerformanceRange, dataSignature: string) {
+  return `${range}:${dataSignature}`;
+}
+
+function portfolioTrendStorageKey(cacheKey: string) {
+  return `${PORTFOLIO_TREND_CACHE_PREFIX}${cacheKey}`;
+}
+
+function readStoredPortfolioTrend(cacheKey: string) {
+  if (typeof window === 'undefined') return null;
+
+  try {
+    const storageKey = portfolioTrendStorageKey(cacheKey);
+    const raw = window.sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+
+    const entry = JSON.parse(raw) as Partial<PortfolioTrendCacheEntry>;
+    if (!entry.result || !Array.isArray(entry.result.points) || typeof entry.expiresAt !== 'number') {
+      window.sessionStorage.removeItem(storageKey);
+      return null;
+    }
+    if (entry.expiresAt <= Date.now()) {
+      window.sessionStorage.removeItem(storageKey);
+      return null;
+    }
+
+    return entry as PortfolioTrendCacheEntry;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredPortfolioTrend(cacheKey: string, entry: PortfolioTrendCacheEntry) {
+  if (typeof window === 'undefined') return;
+
+  try {
+    window.sessionStorage.setItem(portfolioTrendStorageKey(cacheKey), JSON.stringify(entry));
+  } catch {
+    // The in-memory cache still keeps route changes fast when session storage is unavailable.
+  }
+}
+
+function readPortfolioTrendCache(range: PerformanceRange, dataSignature: string) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const memoryEntry = portfolioTrendMemoryCache.get(cacheKey);
+  if (memoryEntry && memoryEntry.expiresAt > Date.now()) return memoryEntry.result;
+  if (memoryEntry) portfolioTrendMemoryCache.delete(cacheKey);
+
+  const storedEntry = readStoredPortfolioTrend(cacheKey);
+  if (!storedEntry) return null;
+
+  portfolioTrendMemoryCache.set(cacheKey, storedEntry);
+  return storedEntry.result;
+}
+
+function writePortfolioTrendCache(range: PerformanceRange, dataSignature: string, result: PortfolioNavResult) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const entry = {
+    expiresAt: Date.now() + PORTFOLIO_TREND_CACHE_TTL_MS,
+    result,
+  };
+
+  portfolioTrendMemoryCache.set(cacheKey, entry);
+  writeStoredPortfolioTrend(cacheKey, entry);
+}
+
+function clearPortfolioTrendCache() {
+  portfolioTrendCacheVersion += 1;
+  portfolioTrendMemoryCache.clear();
+  portfolioTrendInflight.clear();
+
+  if (typeof window === 'undefined') return;
+
+  try {
+    for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.sessionStorage.key(index);
+      if (key && key.startsWith(PORTFOLIO_TREND_CACHE_PREFIX)) {
+        window.sessionStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // Ignore storage failures; cache misses will simply refetch.
+  }
+}
+
+function loadPortfolioTrend(range: PerformanceRange, dataSignature: string) {
+  const cacheKey = portfolioTrendCacheKey(range, dataSignature);
+  const cached = readPortfolioTrendCache(range, dataSignature);
+  if (cached) return Promise.resolve(cached);
+
+  const inflight = portfolioTrendInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const versionAtStart = portfolioTrendCacheVersion;
+  const request = getPortfolioNav(range)
+    .then(result => {
+      if (versionAtStart === portfolioTrendCacheVersion) {
+        writePortfolioTrendCache(range, dataSignature, result);
+      }
+      return result;
+    })
+    .finally(() => {
+      if (portfolioTrendInflight.get(cacheKey) === request) {
+        portfolioTrendInflight.delete(cacheKey);
+      }
+    });
+
+  portfolioTrendInflight.set(cacheKey, request);
+  return request;
+}
 
 const companyNames: Record<string, string> = {
   AAPL: 'Apple Inc.',
@@ -454,7 +620,8 @@ function PortfolioTrendChart({
   range: PerformanceRange;
 }) {
   const gradientId = useId().replace(/:/g, '');
-  const [hovered, setHovered] = useState<{ point: PortfolioNavPoint & { changePercent: number }; x: number; y: number } | null>(null);
+  type TrendPoint = PortfolioNavPoint & { changePercent: number; x: number; y: number };
+  const [hovered, setHovered] = useState<{ point: TrendPoint; x: number; y: number } | null>(null);
   const width = 640;
   const height = 152;
   const padding = { bottom: 22, left: 48, right: 12, top: 12 };
@@ -463,24 +630,31 @@ function PortfolioTrendChart({
   const series = data.length > 1 ? data : [];
   const startPoint = series[0];
   const currentPoint = series[series.length - 1];
-  const minPoint = series.reduce<PortfolioNavPoint | null>((min, point) => {
-    if (!min || point.unitNav < min.unitNav) return point;
-    return min;
-  }, null);
-  const min = series.length ? Math.min(...series.map(point => point.unitNav)) : 0;
-  const max = series.length ? Math.max(...series.map(point => point.unitNav)) : 1;
+  const rawValues = series.map(point => (
+    startPoint && startPoint.unitNav > 0
+      ? ((point.unitNav - startPoint.unitNav) / startPoint.unitNav) * 100
+      : 0
+  ));
+  const rawMin = rawValues.length ? Math.min(...rawValues) : 0;
+  const rawMax = rawValues.length ? Math.max(...rawValues) : 1;
+  const min = rawMin === rawMax ? rawMin - 1 : rawMin;
+  const max = rawMin === rawMax ? rawMax + 1 : rawMax;
   const rangeValue = max - min || 1;
-  const plotted = series.map((point, index) => {
+  const plotted: TrendPoint[] = series.map((point, index) => {
     const x = padding.left + (index / (series.length - 1 || 1)) * plotWidth;
-    const y = padding.top + plotHeight - ((point.unitNav - min) / rangeValue) * plotHeight;
-    const changePercent = startPoint ? ((point.unitNav - startPoint.unitNav) / startPoint.unitNav) * 100 : 0;
+    const changePercent = rawValues[index] || 0;
+    const y = padding.top + plotHeight - ((changePercent - min) / rangeValue) * plotHeight;
     return { ...point, changePercent, x, y };
   });
-  const currentChangePercent = currentPoint && startPoint
+  const minPoint = plotted.reduce<TrendPoint | null>((lowest, point) => {
+    if (!lowest || point.changePercent < lowest.changePercent) return point;
+    return lowest;
+  }, null);
+  const currentChangePercent = currentPoint && startPoint && startPoint.unitNav > 0
     ? ((currentPoint.unitNav - startPoint.unitNav) / startPoint.unitNav) * 100
     : 0;
-  const isUp = currentPoint && startPoint ? currentPoint.unitNav >= startPoint.unitNav : true;
-  const tone = valueTone(currentPoint && startPoint ? currentPoint.unitNav - startPoint.unitNav : 0, currentChangePercent);
+  const isUp = currentChangePercent >= 0;
+  const tone = valueTone(currentChangePercent, currentChangePercent);
   const color = isUp ? '#22c55e' : tone === 'negative-soft' ? '#fb7185' : '#ef4444';
   const points = plotted.map(point => `${point.x},${point.y}`);
   const areaPath =
@@ -488,6 +662,7 @@ function PortfolioTrendChart({
       ? `M ${plotted[0].x} ${padding.top + plotHeight} L ${points.join(' L ')} L ${plotted[plotted.length - 1].x} ${padding.top + plotHeight} Z`
       : '';
   const yTicks = [max, min + rangeValue / 2, min];
+  const chartNote = dataNote.replace(/单位净值/g, '盈亏曲线');
 
   function handleMouseMove(event: React.MouseEvent<SVGSVGElement>) {
     if (plotted.length === 0) return;
@@ -512,10 +687,10 @@ function PortfolioTrendChart({
     <div className="metric-card portfolio-trend-card">
       <div className="trend-card-head">
         <div>
-          <span>单位净值走势</span>
-          <small>{dataNote}</small>
+          <span>盈亏曲线</span>
+          <small>{chartNote}</small>
         </div>
-        <div className="range-switcher" aria-label="组合净值走势周期">
+        <div className="range-switcher" aria-label="盈亏曲线周期">
           {performanceOptions.map(option => (
             <button
               className={range === option ? 'active' : ''}
@@ -532,7 +707,7 @@ function PortfolioTrendChart({
       {plotted.length > 1 ? (
         <div className="performance-chart-wrap" onMouseLeave={() => setHovered(null)}>
           <svg
-            aria-label={`单位净值走势，周期 ${range}`}
+            aria-label={`盈亏曲线，周期 ${range}`}
             className="hero-area-chart"
             height={height}
             onMouseMove={handleMouseMove}
@@ -558,7 +733,7 @@ function PortfolioTrendChart({
                     y2={y}
                   />
                   <text className="chart-axis-label" x={0} y={y + 4}>
-                    {unitNav(tick)}
+                    {percent(tick)}
                   </text>
                 </g>
               );
@@ -574,7 +749,7 @@ function PortfolioTrendChart({
             />
             {plotted.map((point, index) => {
               const isLast = index === plotted.length - 1;
-              const isLowest = minPoint?.date === point.date && minPoint?.unitNav === point.unitNav;
+              const isLowest = minPoint?.date === point.date && minPoint?.changePercent === point.changePercent;
               return (
                 <g key={`${point.date}-${index}`}>
                   {(isLast || index === 0 || isLowest) && (
@@ -601,15 +776,16 @@ function PortfolioTrendChart({
               }}
             >
               <span>{hovered.point.date}</span>
-              <strong>单位净值 {unitNav(hovered.point.unitNav)}</strong>
-              <small>{money(hovered.point.totalAssets)}</small>
-              <b className={pnlClass(hovered.point.changePercent)}>{percent(hovered.point.changePercent)}</b>
+              <strong className={pnlClass(hovered.point.changePercent)}>
+                收益率 {percent(hovered.point.changePercent)}
+              </strong>
+              <small>总资产 {money(hovered.point.totalAssets)}</small>
             </div>
           )}
         </div>
       ) : (
         <div className="trend-empty">
-          {loading ? '正在计算单位净值...' : error || '单位净值数据不足，等待交易和历史行情累积后展示。'}
+          {loading ? '正在计算盈亏曲线...' : error || '盈亏曲线数据不足，等待交易和历史行情累积后展示。'}
         </div>
       )}
     </div>
@@ -933,13 +1109,13 @@ export default function Holdings() {
   const [editingId, setEditingId] = useState('');
   const [priceDraft, setPriceDraft] = useState('');
   const [holdingFilter, setHoldingFilter] = useState<HoldingFilter>('all');
-  const [performanceRange, setPerformanceRange] = useState<PerformanceRange>('1D');
+  const [performanceRange, setPerformanceRange] = useState<PerformanceRange>('7D');
   const [sortConfig, setSortConfig] = useState<SortConfig>({ direction: 'desc', key: 'marketValue' });
   const [navResult, setNavResult] = useState<PortfolioNavResult | null>(null);
   const [navLoading, setNavLoading] = useState(false);
   const [navError, setNavError] = useState('');
   const [navReloadKey, setNavReloadKey] = useState(0);
-  const navCacheRef = useRef(new Map<PerformanceRange, PortfolioNavResult>());
+  const [portfolioDataSignature, setPortfolioDataSignature] = useState('');
 
   async function loadHoldings() {
     setError('');
@@ -950,6 +1126,7 @@ export default function Holdings() {
     ]);
     setHoldings(data);
     setCashBalance(calculateCashBalance(flows, trades));
+    setPortfolioDataSignature(buildPortfolioTrendDataSignature(data, flows, trades));
     setQuoteFailures(new Set());
   }
 
@@ -980,7 +1157,16 @@ export default function Holdings() {
   useEffect(() => {
     let cancelled = false;
     setNavError('');
-    const cached = navCacheRef.current.get(performanceRange);
+
+    if (!portfolioDataSignature) {
+      setNavResult(null);
+      setNavLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const cached = readPortfolioTrendCache(performanceRange, portfolioDataSignature);
     if (cached) {
       setNavResult(cached);
       setNavLoading(false);
@@ -991,13 +1177,12 @@ export default function Holdings() {
 
     setNavLoading(true);
 
-    getPortfolioNav(performanceRange)
+    loadPortfolioTrend(performanceRange, portfolioDataSignature)
       .then(result => {
-        navCacheRef.current.set(performanceRange, result);
         if (!cancelled) setNavResult(result);
       })
       .catch(err => {
-        if (!cancelled) setNavError(err instanceof Error ? err.message : '单位净值加载失败');
+        if (!cancelled) setNavError(err instanceof Error ? err.message : '盈亏曲线加载失败');
       })
       .finally(() => {
         if (!cancelled) setNavLoading(false);
@@ -1006,7 +1191,7 @@ export default function Holdings() {
     return () => {
       cancelled = true;
     };
-  }, [navReloadKey, performanceRange]);
+  }, [navReloadKey, performanceRange, portfolioDataSignature]);
 
   const filteredAndSortedMetrics = useMemo(() => {
     const filtered = metrics.filter(metric => {
@@ -1053,7 +1238,7 @@ export default function Holdings() {
         });
       }
       setNavReloadKey(value => value + 1);
-      navCacheRef.current.clear();
+      clearPortfolioTrendCache();
     } catch (err) {
       setRefreshStatus({
         text: err instanceof Error ? err.message : '行情刷新失败',
@@ -1085,7 +1270,7 @@ export default function Holdings() {
       setHoldings(items => items.map(item => (item.id === updated.id ? updated : item)));
       setEditingId('');
       setMessage(`${holding.stock_code} 现价已更新`);
-      navCacheRef.current.clear();
+      clearPortfolioTrendCache();
       setNavReloadKey(value => value + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : '现价更新失败');
@@ -1157,7 +1342,7 @@ export default function Holdings() {
 
         <PortfolioTrendChart
           data={navResult?.points || []}
-          dataNote={navResult?.data_note || '单位净值按交易记录、资金流水和历史行情计算'}
+          dataNote={navResult?.data_note || '盈亏曲线按交易记录、资金流水和历史行情计算'}
           error={navError}
           loading={navLoading}
           onRangeChange={setPerformanceRange}
