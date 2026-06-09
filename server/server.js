@@ -55,6 +55,7 @@ const LOGO_DOMAINS = {
   SMH: 'vaneck.com',
   VGT: 'vanguard.com',
 };
+const US_MARKET_TIME_ZONE = 'America/New_York';
 
 function loadLocalEnv() {
   ['.env.local', '.env'].forEach(fileName => {
@@ -540,6 +541,43 @@ function dateKey(value) {
   return date.toISOString().slice(0, 10);
 }
 
+function timeZoneParts(value, timeZone) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const parts = new Intl.DateTimeFormat('en-US', {
+    day: '2-digit',
+    hour: '2-digit',
+    hour12: false,
+    hourCycle: 'h23',
+    minute: '2-digit',
+    month: '2-digit',
+    timeZone,
+    year: 'numeric',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+
+  return {
+    day: values.day,
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+    month: values.month,
+    year: values.year,
+  };
+}
+
+function marketDateKey(value) {
+  const parts = timeZoneParts(value, US_MARKET_TIME_ZONE);
+  if (!parts) return dateKey(value);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function marketMinutes(value) {
+  const parts = timeZoneParts(value, US_MARKET_TIME_ZONE);
+  if (!parts || !Number.isFinite(parts.hour) || !Number.isFinite(parts.minute)) return 0;
+  return parts.hour * 60 + parts.minute;
+}
+
 function utcDate(key) {
   return new Date(`${key}T00:00:00.000Z`);
 }
@@ -563,6 +601,22 @@ function previousTradingDate(key) {
   let current = addDays(key, -1);
   while (isWeekend(current)) current = addDays(current, -1);
   return current;
+}
+
+function lastCompletedUsTradingDate(now = new Date()) {
+  const today = marketDateKey(now);
+  if (!today) return dateKey(now);
+  if (isWeekend(today) || marketMinutes(now) < 16 * 60) return previousTradingDate(today);
+  return today;
+}
+
+function isCompletedUsMarketDate(key, now = new Date()) {
+  if (!key || isWeekend(key)) return false;
+  const today = marketDateKey(now);
+  const comparison = compareDateKeys(key, today);
+  if (comparison < 0) return true;
+  if (comparison > 0) return false;
+  return marketMinutes(now) >= 16 * 60;
 }
 
 function rangeStartDate(range, latestDate) {
@@ -702,16 +756,20 @@ function seedQuoteHistoryFromHoldings(store) {
 
   store.holdings.forEach(holding => {
     const currentPrice = Number(holding.current_price);
-    const quoteDate = dateKey(holding.quote_time || holding.quote_updated_at || holding.updated_at);
+    const quoteDate = holding.quote_time
+      ? marketDateKey(holding.quote_time)
+      : dateKey(holding.quote_updated_at || holding.updated_at);
     if (!quoteDate || !Number.isFinite(currentPrice) || currentPrice <= 0) return;
 
-    changed = upsertQuoteHistory(store, {
-      stock_code: holding.stock_code,
-      date: quoteDate,
-      close: currentPrice,
-      source: holding.quote_source || 'holding-current',
-      observed_at: holding.quote_updated_at || holding.updated_at || new Date().toISOString(),
-    }, { preserveProviderRow: true }) || changed;
+    if (isCompletedUsMarketDate(quoteDate)) {
+      changed = upsertQuoteHistory(store, {
+        stock_code: holding.stock_code,
+        date: quoteDate,
+        close: currentPrice,
+        source: holding.quote_source || 'holding-current',
+        observed_at: holding.quote_updated_at || holding.updated_at || new Date().toISOString(),
+      }, { preserveProviderRow: true }) || changed;
+    }
 
     const quoteChange = Number(holding.quote_change);
     const previousClose = currentPrice - quoteChange;
@@ -1039,7 +1097,7 @@ async function fetchAlpacaQuotes(stockCodes) {
     const priceInfo = priceInfoForSymbol(quoteSymbol);
     if (!priceInfo) return;
 
-    const quoteDate = dateKey(priceInfo.time);
+    const quoteDate = marketDateKey(priceInfo.time);
     const previousClose = previousCloseForStock(stockCode, quoteDate);
     const quoteChange = previousClose ? priceInfo.price - previousClose : 0;
     const quoteChangePercent = previousClose ? (quoteChange / previousClose) * 100 : 0;
@@ -1090,7 +1148,7 @@ async function fetchAlpacaDailyHistory(stockCodes, fromDate, toDate) {
       if (!stockCode || !Array.isArray(rows)) return;
 
       rows.forEach(row => {
-        const date = dateKey(row && row.t);
+        const date = marketDateKey(row && row.t);
         const close = alpacaBarClose(row);
         if (!date || compareDateKeys(date, fromDate) < 0 || compareDateKeys(date, toDate) > 0 || !close) return;
 
@@ -1230,14 +1288,16 @@ async function refreshHoldingPrices(store) {
     holding.quote_change_percent = quote.quote_change_percent;
     holding.quote_updated_at = quote.quote_updated_at;
     holding.updated_at = quote.quote_updated_at;
-    const quoteDate = dateKey(quote.quote_time || quote.quote_updated_at);
-    upsertQuoteHistory(store, {
-      stock_code: holding.stock_code,
-      date: quoteDate,
-      close: quote.current_price,
-      source: quote.quote_source,
-      observed_at: quote.quote_updated_at,
-    });
+    const quoteDate = quote.quote_time ? marketDateKey(quote.quote_time) : dateKey(quote.quote_updated_at);
+    if (isCompletedUsMarketDate(quoteDate)) {
+      upsertQuoteHistory(store, {
+        stock_code: holding.stock_code,
+        date: quoteDate,
+        close: quote.current_price,
+        source: quote.quote_source,
+        observed_at: quote.quote_updated_at,
+      }, { preserveProviderRow: true });
+    }
     if (Number.isFinite(Number(quote.quote_change)) && Number(quote.quote_change) !== 0) {
       const previousClose = quote.current_price - Number(quote.quote_change);
       if (quoteDate && previousClose > 0) {
@@ -1351,17 +1411,22 @@ function buildPortfolioNavSeries(store, range) {
   const trades = sortedTradeEvents(store.trades || []);
   const fundFlows = sortedFundFlowEvents(store.fund_flows || []);
   const quoteMaps = buildQuoteMaps(store);
-  const quoteDates = ensureQuoteHistory(store).map(item => dateKey(item.date)).filter(Boolean);
+  const latestCompletedDate = lastCompletedUsTradingDate();
+  const quoteDates = ensureQuoteHistory(store)
+    .map(item => dateKey(item.date))
+    .filter(date => date && compareDateKeys(date, latestCompletedDate) <= 0);
   const tradeDates = trades.map(trade => trade.date);
   const flowDates = fundFlows.map(flow => flow.date);
+  const eligibleTradeDates = tradeDates.filter(date => compareDateKeys(date, latestCompletedDate) <= 0);
+  const eligibleFlowDates = flowDates.filter(date => compareDateKeys(date, latestCompletedDate) <= 0);
   const firstTradeDate = [...tradeDates].sort(compareDateKeys)[0] || '';
   const firstFlowDate = [...flowDates].sort(compareDateKeys)[0] || '';
-  const allDates = [...quoteDates, ...tradeDates, ...flowDates].sort(compareDateKeys);
-  const latestDate = allDates[allDates.length - 1] || dateKey(new Date());
-  const firstEventDate = [...tradeDates, ...flowDates].sort(compareDateKeys)[0] || latestDate;
+  const allDates = [...quoteDates, ...eligibleTradeDates, ...eligibleFlowDates].sort(compareDateKeys);
+  const latestDate = allDates[allDates.length - 1] || latestCompletedDate;
+  const firstEventDate = [...eligibleTradeDates, ...eligibleFlowDates].sort(compareDateKeys)[0] || latestDate;
   const startDate = rangeStartDate(range, latestDate);
   const processStartDate = compareDateKeys(firstEventDate, startDate) < 0 ? firstEventDate : startDate;
-  const eventDates = new Set([...tradeDates, ...flowDates, latestDate]);
+  const eventDates = new Set([...eligibleTradeDates, ...eligibleFlowDates, latestDate]);
   const valuationDates = enumerateValuationDates(processStartDate, latestDate, eventDates);
   const inferTradeFlows =
     fundFlows.length === 0 ||
@@ -1548,8 +1613,7 @@ async function buildFreshPortfolioNav(store, normalizedRange) {
       ...store.trades.map(item => item.stock_code),
     ].filter(Boolean).map(item => String(item).toUpperCase())),
   ];
-  const seededDates = ensureQuoteHistory(store).map(item => dateKey(item.date)).filter(Boolean).sort(compareDateKeys);
-  const latestDate = seededDates[seededDates.length - 1] || dateKey(new Date());
+  const latestDate = lastCompletedUsTradingDate();
   const fromDate = rangeStartDate(normalizedRange, latestDate);
   let historyUpdates = [];
 

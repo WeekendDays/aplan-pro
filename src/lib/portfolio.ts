@@ -1,4 +1,4 @@
-import { Trade } from './types';
+import { FundFlow, Trade } from './types';
 
 export const DEFAULT_SECTORS = [
   '科技',
@@ -46,6 +46,26 @@ export function tradeNetAmount(trade: Pick<Trade, 'quantity' | 'price' | 'commis
   const gross = tradeGrossAmount(trade);
   const commission = tradeCommission(trade);
   return trade.trade_type === 'buy' ? gross + commission : gross - commission;
+}
+
+export function calculateNetFundFlow(flows: FundFlow[]) {
+  return flows.reduce((sum, flow) => {
+    const amount = Number(flow.amount);
+    if (!Number.isFinite(amount)) return sum;
+    return sum + (flow.flow_type === 'deposit' ? amount : -amount);
+  }, 0);
+}
+
+export function calculateTradeCashImpact(trades: Trade[]) {
+  return trades.reduce((sum, trade) => {
+    const amount = tradeNetAmount(trade);
+    if (!Number.isFinite(amount)) return sum;
+    return sum + (trade.trade_type === 'buy' ? -amount : amount);
+  }, 0);
+}
+
+export function calculateCashBalance(flows: FundFlow[], trades: Trade[]) {
+  return calculateNetFundFlow(flows) + calculateTradeCashImpact(trades);
 }
 
 export function calculateRealizedPnl(trades: Trade[]) {
